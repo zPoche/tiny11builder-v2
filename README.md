@@ -129,19 +129,17 @@ You should replace the Capability with the one returned of course.
 ---
 
 ## Known issues:
-- `autounattend.xml` is configured for **amd64** only. arm64 ISO builds need an architecture-specific answer file.
 - `tiny11Coremaker.ps1` does not support `-Custom` debloat or ISO auto-mount (use `tiny11maker.ps1` for those features).
 - Although Edge is removed, there are some remnants in the Settings, but the app in itself is deleted. 
 - You might have to update Winget before being able to install any apps, using Microsoft Store.
 - Outlook and Dev Home might reappear after some time. This is an ongoing battle, though the latest script update tries to prevent this more aggressively.
-- If you are using this script on arm64, you might see a glimpse of an error while running the script. This is caused by the fact that the arm64 image doesn't have OneDriveSetup.exe included in the System32 folder.
 
 ---
 
 ## Features to be implemented:
 - ~~disabling telemetry~~ (Implemented in the 04-29-24 release!)
 - ~~more ad suppression~~ (Partially implemented in the 09-06-25 release!)
-- improved language and arch detection
+- ~~improved language and arch detection~~ (arm64 `autounattend-arm64.xml` + arch-aware package removal in core)
 - ~~more flexibility in what to keep and what to delete~~ (Use `-Custom` or edit `removePackage.txt`)
 - maybe a GUI???
 

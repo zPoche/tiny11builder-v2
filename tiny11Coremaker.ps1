@@ -10,6 +10,18 @@ function Assert-CommandExitCode {
     }
 }
 
+function Invoke-DismChecked {
+    param(
+        [string]$Label,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$DismArgs
+    )
+    & dism @DismArgs
+    Assert-CommandExitCode -Label $Label
+}
+
+$script:LoadedRegHives = [System.Collections.Generic.List[string]]::new()
+
 function Format-ProcessArgument {
     param([string]$Argument)
     if ($Argument -match '\s') {
@@ -28,7 +40,7 @@ function Test-CoremakerPrerequisites {
     if (-not (Get-Command 'dism.exe' -ErrorAction SilentlyContinue)) {
         throw "DISM was not found. Install the Windows ADK or run on a Windows edition with deployment tools."
     }
-    foreach ($cmd in @('Mount-WindowsImage', 'Dismount-WindowsImage', 'Get-WindowsImage')) {
+    foreach ($cmd in @('Mount-WindowsImage', 'Dismount-WindowsImage', 'Get-WindowsImage', 'Export-WindowsImage')) {
         if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
             throw "Required cmdlet '$cmd' was not found."
         }
@@ -58,12 +70,40 @@ function Invoke-RegLoad {
     )
     reg load "HKLM\$HiveName" $FilePath
     Assert-CommandExitCode -Label "reg load HKLM\$HiveName"
+    if (-not $script:LoadedRegHives.Contains($HiveName)) {
+        $script:LoadedRegHives.Add($HiveName)
+    }
 }
 
 function Invoke-RegUnload {
     param([string]$HiveName)
     reg unload "HKLM\$HiveName"
     Assert-CommandExitCode -Label "reg unload HKLM\$HiveName"
+    if ($script:LoadedRegHives.Contains($HiveName)) {
+        $script:LoadedRegHives.Remove($HiveName)
+    }
+}
+
+function Unload-LoadedRegistries {
+    for ($i = $script:LoadedRegHives.Count - 1; $i -ge 0; $i--) {
+        $hive = $script:LoadedRegHives[$i]
+        reg unload "HKLM\$hive" 2>&1 | Out-Null
+        $script:LoadedRegHives.RemoveAt($i)
+    }
+}
+
+function Resolve-AutounattendFile {
+    param([string]$Architecture)
+    if ($Architecture -eq 'arm64') {
+        $arm64Path = "$PSScriptRoot\autounattend-arm64.xml"
+        if (Test-Path $arm64Path) { return $arm64Path }
+        Write-Warning "autounattend-arm64.xml not found; falling back to autounattend.xml (amd64)."
+    }
+    $defaultPath = "$PSScriptRoot\autounattend.xml"
+    if (-not (Test-Path $defaultPath)) {
+        throw "autounattend.xml not found in $PSScriptRoot"
+    }
+    return $defaultPath
 }
 
 function Set-RegistryValue {
@@ -136,6 +176,7 @@ Start-Transcript -Path "$PSScriptRoot\tiny11.log"
 
 trap {
     Write-Error "Script failed: $($_.Exception.Message)"
+    Unload-LoadedRegistries
     Stop-Transcript -ErrorAction SilentlyContinue
     Read-Host "Press Enter to exit"
     exit 1
@@ -143,8 +184,17 @@ trap {
 
 Write-Host "Welcome to tiny11 core builder! BETA 09-05-25"
 Write-Host "This script generates a significantly reduced Windows 11 image. However, it's not suitable for regular use due to its lack of serviceability - you can't add languages, updates, or features post-creation. tiny11 Core is not a full Windows 11 substitute but a rapid testing or development tool, potentially useful for VM environments."
+if (-not (Test-Path "$PSScriptRoot\autounattend.xml")) {
+    throw "autounattend.xml not found in $PSScriptRoot. Ensure it is present before running the script."
+}
+
 Write-Host "Do you want to continue? (y/n)"
-$continueChoice = Read-Host
+do {
+    $continueChoice = (Read-Host).Trim().ToLowerInvariant()
+    if ($continueChoice -notin @('y', 'n')) {
+        Write-Host "Invalid input. Enter 'y' to continue or 'n' to exit."
+    }
+} while ($continueChoice -notin @('y', 'n'))
 
 if ($continueChoice -eq 'y') {
     Write-Host "Off we go..."
@@ -170,11 +220,15 @@ do {
 if ((Test-Path "$DriveLetter\sources\boot.wim") -eq $false -or (Test-Path "$DriveLetter\sources\install.wim") -eq $false) {
     if ((Test-Path "$DriveLetter\sources\install.esd") -eq $true) {
         Write-Host "Found install.esd, converting to install.wim..."
-        &  'dism' '/English' "/Get-WimInfo" "/wimfile:$DriveLetter\sources\install.esd"
-        $index = Read-Host "Please enter the image index"
+        $esdIndex = $null
+        $esdIndexes = (Get-WindowsImage -ImagePath "$DriveLetter\sources\install.esd").ImageIndex
+        while ($esdIndexes -notcontains $esdIndex) {
+            Get-WindowsImage -ImagePath "$DriveLetter\sources\install.esd"
+            $esdIndex = [int](Read-Host "Please enter the image index")
+        }
         Write-Host ' '
         Write-Host 'Converting install.esd to install.wim. This may take a while...'
-        & 'DISM' /Export-Image /SourceImageFile:"$DriveLetter\sources\install.esd" /SourceIndex:$index /DestinationImageFile:"$mainOSDrive\tiny11\sources\install.wim" /Compress:max /CheckIntegrity
+        Export-WindowsImage -SourceImagePath "$DriveLetter\sources\install.esd" -SourceIndex $esdIndex -DestinationImagePath "$mainOSDrive\tiny11\sources\install.wim" -CompressionType Maximum -CheckIntegrity
     } else {
         Write-Host "Can't find Windows OS Installation files in the specified Drive Letter.."
         Write-Host "Please enter the correct DVD Drive Letter.."
@@ -206,7 +260,7 @@ try {
     # This block will catch the error and suppress it.
 }
 New-Item -ItemType Directory -Force -Path "$mainOSDrive\scratchdir" | Out-Null
-& dism /English "/mount-image" "/imagefile:$($env:SystemDrive)\tiny11\sources\install.wim" "/index:$index" "/mountdir:$($env:SystemDrive)\scratchdir"
+Mount-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\install.wim" -Index $index -Path "$mainOSDrive\scratchdir"
 
 $imageIntl = & dism /English /Get-Intl "/Image:$($env:SystemDrive)\scratchdir"
 $languageLine = $imageIntl -split '\n' | Where-Object { $_ -match 'Default system UI language : ([a-zA-Z]{2}-[a-zA-Z]{2})' }
@@ -249,8 +303,12 @@ $packages = & 'dism' '/English' "/image:$($env:SystemDrive)\scratchdir" '/Get-Pr
 $packagePrefixes = 'Clipchamp.Clipchamp_', 'Microsoft.BingNews_', 'Microsoft.BingWeather_', 'Microsoft.GamingApp_', 'Microsoft.GetHelp_', 'Microsoft.Getstarted_', 'Microsoft.MicrosoftOfficeHub_', 'Microsoft.MicrosoftSolitaireCollection_', 'Microsoft.People_', 'Microsoft.PowerAutomateDesktop_', 'Microsoft.Todos_', 'Microsoft.WindowsAlarms_', 'microsoft.windowscommunicationsapps_', 'Microsoft.WindowsFeedbackHub_', 'Microsoft.WindowsMaps_', 'Microsoft.WindowsSoundRecorder_', 'Microsoft.Xbox.TCUI_', 'Microsoft.XboxGamingOverlay_', 'Microsoft.XboxGameOverlay_', 'Microsoft.XboxSpeechToTextOverlay_', 'Microsoft.YourPhone_', 'Microsoft.ZuneMusic_', 'Microsoft.ZuneVideo_', 'MicrosoftCorporationII.MicrosoftFamily_', 'MicrosoftCorporationII.QuickAssist_', 'MicrosoftTeams_', 'Microsoft.549981C3F5F10_', 'Microsoft.Windows.Copilot', 'MSTeams_', 'Microsoft.OutlookForWindows_', 'Microsoft.Windows.Teams_', 'Microsoft.Copilot_'
 
 $packagesToRemove = $packages | Where-Object {
-    $packageName = $_
-    $packagePrefixes -contains ($packagePrefixes | Where-Object { $packageName -like "$_*" })
+    $pkg = $_
+    $match = $false
+    foreach ($pref in $packagePrefixes) {
+        if ($pkg -like "*$pref*") { $match = $true; break }
+    }
+    $match
 }
 foreach ($package in $packagesToRemove) {
     write-host "Removing $package :"
@@ -262,9 +320,10 @@ Start-Sleep -Seconds 1
 Clear-Host
 
 $scratchDir = "$($env:SystemDrive)\scratchdir"
+$archSuffix = if ($architecture) { $architecture } else { 'amd64' }
 $packagePatterns = @(
     "Microsoft-Windows-InternetExplorer-Optional-Package~31bf3856ad364e35",
-    "Microsoft-Windows-Kernel-LA57-FoD-Package~31bf3856ad364e35~amd64",
+    "Microsoft-Windows-Kernel-LA57-FoD-Package~31bf3856ad364e35~$archSuffix",
     "Microsoft-Windows-LanguageFeatures-Handwriting-$languageCode-Package~31bf3856ad364e35",
     "Microsoft-Windows-LanguageFeatures-OCR-$languageCode-Package~31bf3856ad364e35",
     "Microsoft-Windows-LanguageFeatures-Speech-$languageCode-Package~31bf3856ad364e35",
@@ -296,18 +355,19 @@ foreach ($packagePattern in $packagePatterns) {
 }
 
 Write-Host "Do you want to enable .NET 3.5? This cannot be done after the image has been created! (y/n)"
-$dotnetChoice = Read-Host
+do {
+    $dotnetChoice = (Read-Host).Trim().ToLowerInvariant()
+    if ($dotnetChoice -notin @('y', 'n')) {
+        Write-Host "Invalid input. Enter 'y' to enable .NET 3.5 or 'n' to continue without it."
+    }
+} while ($dotnetChoice -notin @('y', 'n'))
 
 if ($dotnetChoice -eq 'y') {
     Write-Host "Enabling .NET 3.5..."
-    & 'dism'  "/image:$scratchDir" '/enable-feature' '/featurename:NetFX3' '/All' "/source:$($env:SystemDrive)\tiny11\sources\sxs" 
+    Invoke-DismChecked -Label 'Enable .NET 3.5' /English "/image:$scratchDir" /Enable-Feature /FeatureName:NetFX3 /All "/Source:$($env:SystemDrive)\tiny11\sources\sxs"
     Write-Host ".NET 3.5 has been enabled."
-}
-elseif ($dotnetChoice -eq 'n') {
+} else {
     Write-Host "You chose not to enable .NET 3.5. Continuing..."
-}
-else {
-    Write-Host "Invalid input. Please enter 'y' to enable .NET 3.5 or 'n' to continue without installing .net 3.5."
 }
 Write-Host "Removing Edge:"
 Remove-Item -Path "$mainOSDrive\scratchdir\Program Files (x86)\Microsoft\Edge" -Recurse -Force | Out-Null
@@ -362,7 +422,7 @@ Write-host "Complete!"
 Start-Sleep -Seconds 2
 Clear-Host
 Write-Host "Preparing..."
-$folderPath = Join-Path -Path $mainOSDrive -ChildPath "\scratchdir\Windows\WinSxS_edit"
+$folderPath = Join-Path -Path $mainOSDrive -ChildPath "scratchdir\Windows\WinSxS_edit"
 $sourceDirectory = "$mainOSDrive\scratchdir\Windows\WinSxS"
 $destinationDirectory = "$mainOSDrive\scratchdir\Windows\WinSxS_edit"
 New-Item -Path $folderPath -ItemType Directory
@@ -500,7 +560,8 @@ Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'Disa
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableCloudOptimizedContent' 'REG_DWORD' '1'
 Write-Host "Enabling Local Accounts on OOBE:"
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\OOBE' 'BypassNRO' 'REG_DWORD' '1'
-Copy-Item -Path "$PSScriptRoot\autounattend.xml" -Destination "$mainOSDrive\scratchdir\Windows\System32\Sysprep\autounattend.xml" -Force | Out-Null
+$autounattendSource = Resolve-AutounattendFile -Architecture $architecture
+Copy-Item -Path $autounattendSource -Destination "$mainOSDrive\scratchdir\Windows\System32\Sysprep\autounattend.xml" -Force | Out-Null
 Write-Host "Disabling Reserved Storage:"
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager' 'ShippedWithReserves' 'REG_DWORD' '0'
 Write-Host "Disabling BitLocker Device Encryption"
@@ -598,13 +659,13 @@ Invoke-RegUnload -HiveName 'zNTUSER'
 Invoke-RegUnload -HiveName 'zSOFTWARE'
 Invoke-RegUnload -HiveName 'zSYSTEM'
 Write-Host "Cleaning up image..."
-& 'dism' '/English' "/image:$mainOSDrive\scratchdir" '/Cleanup-Image' '/StartComponentCleanup' '/ResetBase' | Out-Null
+Invoke-DismChecked -Label 'DISM cleanup' /English "/image:$mainOSDrive\scratchdir" /Cleanup-Image /StartComponentCleanup /ResetBase
 Write-Host "Cleanup complete."
 Write-Host ' '
 Write-Host "Unmounting image..."
-& 'dism' '/English' '/unmount-image' "/mountdir:$mainOSDrive\scratchdir" '/commit'
+Dismount-WindowsImage -Path "$mainOSDrive\scratchdir" -Save
 Write-Host "Exporting image..."
-& 'dism' '/English' '/Export-Image' "/SourceImageFile:$mainOSDrive\tiny11\sources\install.wim" "/SourceIndex:$index" "/DestinationImageFile:$mainOSDrive\tiny11\sources\install2.wim" '/compress:max'
+Invoke-DismChecked -Label 'DISM export install.wim' /English /Export-Image "/SourceImageFile:$mainOSDrive\tiny11\sources\install.wim" "/SourceIndex:$index" "/DestinationImageFile:$mainOSDrive\tiny11\sources\install2.wim" /Compress:max
 Remove-Item -Path "$mainOSDrive\tiny11\sources\install.wim" -Force | Out-Null
 Rename-Item -Path "$mainOSDrive\tiny11\sources\install2.wim" -NewName "install.wim" | Out-Null
 Write-Host "Windows image completed. Continuing with boot.wim."
@@ -615,7 +676,7 @@ $wimFilePath = "$($env:SystemDrive)\tiny11\sources\boot.wim"
 & takeown "/F" $wimFilePath | Out-Null
 & icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
 Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false
-& 'dism' '/English' '/mount-image' "/imagefile:$mainOSDrive\tiny11\sources\boot.wim" '/index:2' "/mountdir:$mainOSDrive\scratchdir"
+Mount-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\boot.wim" -Index 2 -Path "$mainOSDrive\scratchdir"
 Write-Host "Loading registry..."
 Invoke-RegLoad -HiveName 'zCOMPONENTS' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\COMPONENTS"
 Invoke-RegLoad -HiveName 'zDEFAULT' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\default"
@@ -642,12 +703,13 @@ Invoke-RegUnload -HiveName 'zNTUSER'
 Invoke-RegUnload -HiveName 'zSOFTWARE'
 Invoke-RegUnload -HiveName 'zSYSTEM'
 Write-Host "Unmounting image..."
-& 'dism' '/English' '/unmount-image' "/mountdir:$mainOSDrive\scratchdir" '/commit'
+Dismount-WindowsImage -Path "$mainOSDrive\scratchdir" -Save
 Clear-Host
 Write-Host "Exporting ESD. This may take a while..."
-& dism /Export-Image /SourceImageFile:"$mainOSDrive\tiny11\sources\install.wim" /SourceIndex:1 /DestinationImageFile:"$mainOSDrive\tiny11\sources\install.esd" /Compress:recovery
+Export-WindowsImage -SourceImagePath "$mainOSDrive\tiny11\sources\install.wim" -SourceIndex $index -DestinationImagePath "$mainOSDrive\tiny11\sources\install.esd" -CompressionType Recovery
 Remove-Item "$mainOSDrive\tiny11\sources\install.wim" -ErrorAction SilentlyContinue | Out-Null
 Write-Host "The tiny11 image is now completed. Proceeding with the making of the ISO..."
+Copy-Item -Path $autounattendSource -Destination "$mainOSDrive\tiny11\autounattend.xml" -Force | Out-Null
 Write-Host "Creating ISO image..."
 & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$mainOSDrive\tiny11\boot\etfsboot.com#pEF,e,b$mainOSDrive\tiny11\efi\microsoft\boot\efisys.bin" "$mainOSDrive\tiny11" "$PSScriptRoot\tiny11.iso"
 Assert-CommandExitCode -Label 'oscdimg ISO creation'
@@ -664,10 +726,8 @@ Stop-Transcript
 
 exit
 }
-elseif ($continueChoice -eq 'n') {
-    Write-Host "You chose not to continue. The script will now exit."
-    exit
-}
 else {
-    Write-Host "Invalid input. Please enter 'y' to continue or 'n' to exit."
+    Write-Host "You chose not to continue. The script will now exit."
+    Stop-Transcript -ErrorAction SilentlyContinue
+    exit
 }

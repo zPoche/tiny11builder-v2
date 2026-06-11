@@ -95,6 +95,8 @@ function Build-ProcessArgumentString {
     return ($Arguments | ForEach-Object { Format-ProcessArgument $_ }) -join ' '
 }
 
+$script:LoadedRegHives = [System.Collections.Generic.List[string]]::new()
+
 function Invoke-RegLoad {
     param(
         [string]$HiveName,
@@ -102,12 +104,40 @@ function Invoke-RegLoad {
     )
     reg load "HKLM\$HiveName" $FilePath
     Assert-CommandExitCode -Label "reg load HKLM\$HiveName"
+    if (-not $script:LoadedRegHives.Contains($HiveName)) {
+        $script:LoadedRegHives.Add($HiveName)
+    }
 }
 
 function Invoke-RegUnload {
     param([string]$HiveName)
     reg unload "HKLM\$HiveName"
     Assert-CommandExitCode -Label "reg unload HKLM\$HiveName"
+    if ($script:LoadedRegHives.Contains($HiveName)) {
+        $script:LoadedRegHives.Remove($HiveName)
+    }
+}
+
+function Unload-LoadedRegistries {
+    for ($i = $script:LoadedRegHives.Count - 1; $i -ge 0; $i--) {
+        $hive = $script:LoadedRegHives[$i]
+        reg unload "HKLM\$hive" 2>&1 | Out-Null
+        $script:LoadedRegHives.RemoveAt($i)
+    }
+}
+
+function Resolve-AutounattendFile {
+    param([string]$Architecture)
+    if ($Architecture -eq 'arm64') {
+        $arm64Path = "$PSScriptRoot\autounattend-arm64.xml"
+        if (Test-Path $arm64Path) { return $arm64Path }
+        Write-Warning "autounattend-arm64.xml not found; falling back to autounattend.xml (amd64)."
+    }
+    $defaultPath = "$PSScriptRoot\autounattend.xml"
+    if (-not (Test-Path $defaultPath)) {
+        throw "autounattend.xml not found in $PSScriptRoot"
+    }
+    return $defaultPath
 }
 
 function Set-RegistryValue {
@@ -391,16 +421,15 @@ if (! $myWindowsPrincipal.IsInRole($adminRole)) {
     exit
 }
 
-$autounattendDownloaded = $false
-if (-not (Test-Path -Path "$PSScriptRoot/autounattend.xml")) {
-    Invoke-RestMethod "https://raw.githubusercontent.com/ntdevlabs/tiny11builder/refs/heads/main/autounattend.xml" -OutFile "$PSScriptRoot/autounattend.xml"
-    $autounattendDownloaded = $true
+if (-not (Test-Path -Path "$PSScriptRoot\autounattend.xml")) {
+    throw "autounattend.xml not found in $PSScriptRoot. Ensure it is present before running the script."
 }
 
 Start-Transcript -Path "$PSScriptRoot\tiny11_$(get-date -f yyyyMMdd_HHmms).log"
 
 trap {
     Write-Error "Script failed: $($_.Exception.Message)"
+    Unload-LoadedRegistries
     Stop-Transcript -ErrorAction SilentlyContinue
     Read-Host "Press Enter to exit"
     exit 1
@@ -421,8 +450,13 @@ $DriveLetter = Resolve-WindowsSource -IsoParameter $ISO
 if ((Test-Path "$DriveLetter\sources\boot.wim") -eq $false -or (Test-Path "$DriveLetter\sources\install.wim") -eq $false) {
     if ((Test-Path "$DriveLetter\sources\install.esd") -eq $true) {
         Write-Output "Found install.esd, converting to install.wim..."
-        Get-WindowsImage -ImagePath $DriveLetter\sources\install.esd
-        $index = [int](Read-Host "Please enter the image index")
+        $esdIndex = $null
+        $esdIndexes = (Get-WindowsImage -ImagePath "$DriveLetter\sources\install.esd").ImageIndex
+        while ($esdIndexes -notcontains $esdIndex) {
+            Get-WindowsImage -ImagePath "$DriveLetter\sources\install.esd"
+            $esdIndex = [int](Read-Host "Please enter the image index")
+        }
+        $index = $esdIndex
         Write-Output ' '
         Write-Output 'Converting install.esd to install.wim. This may take a while...'
         Export-WindowsImage -SourceImagePath $DriveLetter\sources\install.esd -SourceIndex $index -DestinationImagePath $ScratchDisk\tiny11\sources\install.wim -Compressiontype Maximum -CheckIntegrity
@@ -609,7 +643,8 @@ Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'Disa
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableCloudOptimizedContent' 'REG_DWORD' '1'
 Write-Output "Enabling Local Accounts on OOBE:"
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\OOBE' 'BypassNRO' 'REG_DWORD' '1'
-Copy-Item -Path "$PSScriptRoot\autounattend.xml" -Destination "$ScratchDisk\scratchdir\Windows\System32\Sysprep\autounattend.xml" -Force | Out-Null
+$autounattendSource = Resolve-AutounattendFile -Architecture $architecture
+Copy-Item -Path $autounattendSource -Destination "$ScratchDisk\scratchdir\Windows\System32\Sysprep\autounattend.xml" -Force | Out-Null
 
 Write-Output "Disabling Reserved Storage:"
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager' 'ShippedWithReserves' 'REG_DWORD' '0'
@@ -745,7 +780,7 @@ Dismount-WindowsImage -Path $ScratchDisk\scratchdir -Save
 Clear-Host
 Write-Output "The tiny11 image is now completed. Proceeding with the making of the ISO..."
 Write-Output "Copying unattended file for bypassing MS account on OOBE..."
-Copy-Item -Path "$PSScriptRoot\autounattend.xml" -Destination "$ScratchDisk\tiny11\autounattend.xml" -Force | Out-Null
+Copy-Item -Path $autounattendSource -Destination "$ScratchDisk\tiny11\autounattend.xml" -Force | Out-Null
 Write-Output "Creating ISO image..."
 
 & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$ScratchDisk\tiny11\boot\etfsboot.com#pEF,e,b$ScratchDisk\tiny11\efi\microsoft\boot\efisys.bin" "$ScratchDisk\tiny11" "$PSScriptRoot\tiny11.iso"
@@ -756,21 +791,6 @@ Read-Host "Press Enter to continue"
 Write-Output "Performing Cleanup..."
 Remove-Item -Path "$ScratchDisk\tiny11" -Recurse -Force | Out-Null
 Remove-Item -Path "$ScratchDisk\scratchdir" -Recurse -Force | Out-Null
-
-if (-not $MountedByScript) {
-    try {
-        $letter = $DriveLetter.TrimEnd(':')
-        Get-Volume -DriveLetter $letter -ErrorAction Stop | Get-DiskImage | Dismount-DiskImage -ErrorAction SilentlyContinue | Out-Null
-        Write-Output "Source drive $DriveLetter ejected."
-    } catch {
-        Write-Output "Source drive was not mounted or could not be ejected."
-    }
-}
-
-if ($autounattendDownloaded) {
-    Write-Output "Removing downloaded autounattend.xml..."
-    Remove-Item -Path "$PSScriptRoot\autounattend.xml" -Force -ErrorAction SilentlyContinue
-}
 
 Write-Output "Cleanup check :"
 if (Test-Path -Path "$ScratchDisk\tiny11") {
@@ -795,11 +815,6 @@ if (Test-Path -Path "$ScratchDisk\scratchdir") {
 } else {
     Write-Output "scratchdir folder does not exist. No action needed."
 }
-if ($autounattendDownloaded -and (Test-Path -Path "$PSScriptRoot\autounattend.xml")) {
-    Write-Output "autounattend.xml still exists. Attempting to remove it again..."
-    Remove-Item -Path "$PSScriptRoot\autounattend.xml" -Force -ErrorAction SilentlyContinue
-}
-
 Stop-Transcript
 
 exit
