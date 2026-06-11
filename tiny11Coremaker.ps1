@@ -112,6 +112,13 @@ function Invoke-ScriptCleanupOnFailure {
             Write-Warning "Could not dismount scratch image during cleanup."
         }
     }
+    if ($mainOSDrive -and (Test-Path "$mainOSDrive\tiny11")) {
+        try {
+            Remove-Item -Path "$mainOSDrive\tiny11" -Recurse -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "Could not remove partial tiny11 work folder during cleanup."
+        }
+    }
 }
 
 function Resolve-AutounattendFile {
@@ -149,6 +156,9 @@ function Copy-AutounattendWithIndex {
     )
     $xml = Get-Content -Path $SourcePath -Raw
     $xml = $xml -replace '(<Key>/IMAGE/INDEX</Key>\s*<Value>)\d+(</Value>)', "`${1}${ImageIndex}`${2}"
+    if ($xml -notmatch "<Key>/IMAGE/INDEX</Key>\s*<Value>$ImageIndex</Value>") {
+        throw "Failed to patch /IMAGE/INDEX to $ImageIndex in autounattend source."
+    }
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllText($DestinationPath, $xml, $utf8NoBom)
 }
@@ -294,10 +304,10 @@ if (-not (Test-Path "$mainOSDrive\tiny11\sources\install.wim")) {
             Get-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\install.esd"
             $esdIndex = [int](Read-Host "Please enter the image index")
         }
-        $selectedImageIndex = $esdIndex
         Write-Host ' '
         Write-Host 'Converting install.esd to install.wim. This may take a while...'
         Export-WindowsImage -SourceImagePath "$mainOSDrive\tiny11\sources\install.esd" -SourceIndex $esdIndex -DestinationImagePath "$mainOSDrive\tiny11\sources\install.wim" -CompressionType Maximum -CheckIntegrity
+        $selectedImageIndex = 1
     } else {
         throw "Can't find install.wim or install.esd in the copied source. Enter the correct DVD drive letter."
     }
@@ -326,11 +336,7 @@ Write-Host "Mounting Windows image. This may take a while."
 $wimFilePath = "$($env:SystemDrive)\tiny11\sources\install.wim" 
 & takeown "/F" $wimFilePath 
 & icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
-try {
-    Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false -ErrorAction Stop
-} catch {
-    # This block will catch the error and suppress it.
-}
+Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false -ErrorAction Stop
 New-Item -ItemType Directory -Force -Path "$mainOSDrive\scratchdir" | Out-Null
 Mount-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\install.wim" -Index $index -Path "$mainOSDrive\scratchdir"
 
@@ -361,7 +367,7 @@ foreach ($line in $lines) {
 }
 
 if (-not $architecture) {
-    Write-Host "Architecture information not found."
+    throw "Could not detect image architecture. Cannot apply arch-specific package removal or WinSxS trimming."
 }
 
 Write-Host "Mounting complete! Performing removal of applications..."
@@ -791,6 +797,9 @@ Dismount-WindowsImage -Path "$mainOSDrive\scratchdir" -Save
 Clear-Host
 Write-Host "Exporting ESD. This may take a while..."
 Export-WindowsImage -SourceImagePath "$mainOSDrive\tiny11\sources\install.wim" -SourceIndex 1 -DestinationImagePath "$mainOSDrive\tiny11\sources\install.esd" -CompressionType Recovery
+if (-not (Test-Path "$mainOSDrive\tiny11\sources\install.esd")) {
+    throw "ESD export failed: install.esd was not created."
+}
 Remove-Item "$mainOSDrive\tiny11\sources\install.wim" -ErrorAction SilentlyContinue | Out-Null
 Write-Host "The tiny11 image is now completed. Proceeding with the making of the ISO..."
 Copy-AutounattendWithIndex -SourcePath $autounattendSource -DestinationPath "$mainOSDrive\tiny11\autounattend.xml" -ImageIndex 1

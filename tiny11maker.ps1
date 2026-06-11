@@ -138,6 +138,13 @@ function Invoke-ScriptCleanupOnFailure {
             Write-Warning "Could not dismount scratch image during cleanup."
         }
     }
+    if ($ScratchDisk -and (Test-Path "$ScratchDisk\tiny11")) {
+        try {
+            Remove-Item -Path "$ScratchDisk\tiny11" -Recurse -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "Could not remove partial tiny11 work folder during cleanup."
+        }
+    }
 }
 
 function Resolve-AutounattendFile {
@@ -175,6 +182,9 @@ function Copy-AutounattendWithIndex {
     )
     $xml = Get-Content -Path $SourcePath -Raw
     $xml = $xml -replace '(<Key>/IMAGE/INDEX</Key>\s*<Value>)\d+(</Value>)', "`${1}${ImageIndex}`${2}"
+    if ($xml -notmatch "<Key>/IMAGE/INDEX</Key>\s*<Value>$ImageIndex</Value>") {
+        throw "Failed to patch /IMAGE/INDEX to $ImageIndex in autounattend source."
+    }
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllText($DestinationPath, $xml, $utf8NoBom)
 }
@@ -397,10 +407,18 @@ function Resolve-WindowsSource {
             $script:ImagePath = $IsoParameter
             $vol = Mount-DiskImage -ImagePath $script:ImagePath -Access ReadOnly -PassThru | Get-Volume
             if (-not $vol.DriveLetter) {
+                Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
+                $script:ImagePath = $null
                 throw "ISO mounted but no drive letter was assigned."
             }
             $driveLetter = $vol.DriveLetter + ":"
-            Assert-WindowsSourceDrive -DriveRoot $driveLetter
+            try {
+                Assert-WindowsSourceDrive -DriveRoot $driveLetter
+            } catch {
+                Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
+                $script:ImagePath = $null
+                throw
+            }
             $script:MountedByScript = $true
             Write-Output "Mounted $($script:ImagePath) at $driveLetter"
             return $driveLetter
@@ -522,10 +540,10 @@ if (-not (Test-Path "$ScratchDisk\tiny11\sources\install.wim")) {
             Get-WindowsImage -ImagePath "$ScratchDisk\tiny11\sources\install.esd"
             $esdIndex = [int](Read-Host "Please enter the image index")
         }
-        $selectedImageIndex = $esdIndex
         Write-Output ' '
         Write-Output 'Converting install.esd to install.wim. This may take a while...'
         Export-WindowsImage -SourceImagePath "$ScratchDisk\tiny11\sources\install.esd" -SourceIndex $esdIndex -DestinationImagePath "$ScratchDisk\tiny11\sources\install.wim" -CompressionType Maximum -CheckIntegrity
+        $selectedImageIndex = 1
     } else {
         throw "Can't find install.wim or install.esd in the copied source. Provide a valid Windows 11 ISO or mounted drive."
     }
@@ -533,8 +551,8 @@ if (-not (Test-Path "$ScratchDisk\tiny11\sources\install.wim")) {
 if (-not (Test-Path "$ScratchDisk\tiny11\sources\install.wim")) {
     throw "install.wim is missing after copy/conversion. The source may be incomplete."
 }
-if ($MountedByScript -and $ImagePath) {
-    Dismount-DiskImage -ImagePath $ImagePath -ErrorAction SilentlyContinue | Out-Null
+if ($script:MountedByScript -and $script:ImagePath) {
+    Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
     Write-Output "Source ISO unmounted after copy."
 }
 Set-ItemProperty -Path "$ScratchDisk\tiny11\sources\install.esd" -Name IsReadOnly -Value $false -ErrorAction 'Continue' | Out-Null
@@ -558,11 +576,7 @@ Write-Output "Mounting Windows image. This may take a while."
 $wimFilePath = "$ScratchDisk\tiny11\sources\install.wim"
 & takeown "/F" $wimFilePath
 & icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
-try {
-    Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false -ErrorAction Stop
-} catch {
-    Write-Error "$wimFilePath not found"
-}
+Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false -ErrorAction Stop
 New-Item -ItemType Directory -Force -Path "$ScratchDisk\scratchdir" | Out-Null
 Mount-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\install.wim -Index $index -Path $ScratchDisk\scratchdir
 
@@ -591,7 +605,7 @@ foreach ($line in $lines) {
 }
 
 if (-not $architecture) {
-    Write-Output "Architecture information not found."
+    throw "Could not detect image architecture. Cannot apply arch-specific changes or select autounattend."
 }
 
 Write-Output "Mounting complete! Performing removal of applications..."
