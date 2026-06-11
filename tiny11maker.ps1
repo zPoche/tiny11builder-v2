@@ -232,11 +232,11 @@ function Resolve-InstallImageIndex {
     }
     $indexes = @($images | ForEach-Object { $_.ImageIndex })
     if ($null -ne $PreferredIndex -and ($indexes -contains $PreferredIndex)) {
-        Write-Output "Using image index $PreferredIndex from earlier selection."
+        Write-Host "Using image index $PreferredIndex from earlier selection."
         return $PreferredIndex
     }
     if ($indexes.Count -eq 1) {
-        Write-Output "Only one image found; using index $($indexes[0])."
+        Write-Host "Only one image found; using index $($indexes[0])."
         return $indexes[0]
     }
     $index = $null
@@ -245,11 +245,11 @@ function Resolve-InstallImageIndex {
         $rawIndex = Read-Host "Please enter the image index"
         $parsedIndex = 0
         if (-not [int]::TryParse($rawIndex, [ref]$parsedIndex)) {
-            Write-Output "Invalid index. Enter one of: $($indexes -join ', ')"
+            Write-Host "Invalid index. Enter one of: $($indexes -join ', ')"
             continue
         }
         if ($indexes -notcontains $parsedIndex) {
-            Write-Output "Index $parsedIndex is not available. Enter one of: $($indexes -join ', ')"
+            Write-Host "Index $parsedIndex is not available. Enter one of: $($indexes -join ', ')"
             continue
         }
         $index = $parsedIndex
@@ -265,7 +265,7 @@ function Initialize-ScratchWorkspace {
     }
     $mounted = @(Get-WindowsImage -Mounted -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $scratchDir })
     if ($mounted.Count -gt 0) {
-        Write-Output "Dismounting leftover scratch image from a previous run..."
+        Write-Host "Dismounting leftover scratch image from a previous run..."
         Dismount-WindowsImage -Path $scratchDir -Discard -ErrorAction Stop
     }
     Remove-Item -Path $scratchDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -467,29 +467,29 @@ function Test-ScratchDiskSpace {
 function Initialize-Oscdimg {
     param([string]$HostArchitecture)
 
-    Write-Output "Checking for prerequisite oscdimg.exe..."
+    Write-Host "Checking for prerequisite oscdimg.exe..."
     $adkArch = Get-AdkArchitecture -HostArchitecture $HostArchitecture
     $ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$adkArch\Oscdimg"
     $localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
 
     $oscdimgPath = $null
     if ([System.IO.Directory]::Exists($ADKDepTools)) {
-        Write-Output "Will be using oscdimg.exe from system ADK."
+        Write-Host "Will be using oscdimg.exe from system ADK."
         $oscdimgPath = "$ADKDepTools\oscdimg.exe"
     } else {
-        Write-Output "ADK folder not found. Creating/using local copy of oscdimg.exe."
+        Write-Host "ADK folder not found. Creating/using local copy of oscdimg.exe."
         $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
 
         if (-not (Test-Path -Path $localOSCDIMGPath)) {
-            Write-Output "Downloading oscdimg.exe..."
+            Write-Host "Downloading oscdimg.exe..."
             Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
 
             if (-not (Test-Path $localOSCDIMGPath)) {
                 throw "Failed to download oscdimg.exe."
             }
-            Write-Output "oscdimg.exe downloaded successfully."
+            Write-Host "oscdimg.exe downloaded successfully."
         } else {
-            Write-Output "oscdimg.exe already exists locally."
+            Write-Host "oscdimg.exe already exists locally."
         }
 
         $oscdimgPath = $localOSCDIMGPath
@@ -514,7 +514,7 @@ function Mount-IsoAndGetDriveLetter {
     if (-not $diskImage -or -not $diskImage.Attached) {
         Mount-DiskImage -ImagePath $imagePath -Access ReadOnly -PassThru | Out-Null
     } else {
-        Write-Output "ISO is already mounted: $imagePath"
+        Write-Host "ISO is already mounted: $imagePath"
     }
 
     $driveLetter = $null
@@ -560,7 +560,7 @@ function Resolve-WindowsSource {
         if ($IsoParameter -match '^[c-zC-Z]$') {
             $driveLetter = $IsoParameter + ":"
             Assert-WindowsSourceDrive -DriveRoot $driveLetter
-            Write-Output "Using mounted drive $driveLetter"
+            Write-Host "Using mounted drive $driveLetter"
             return $driveLetter
         }
         if ((Test-Path -LiteralPath $IsoParameter -PathType Leaf) -and ($IsoParameter -match '\.iso$')) {
@@ -577,7 +577,7 @@ function Resolve-WindowsSource {
                 throw
             }
             $script:MountedByScript = $true
-            Write-Output "Mounted $($script:ImagePath) at $driveLetter"
+            Write-Host "Mounted $($script:ImagePath) at $driveLetter"
             return $driveLetter
         }
         throw "Invalid -ISO value. Provide a drive letter (e.g. E) or a path to a .iso file."
@@ -591,11 +591,11 @@ function Resolve-WindowsSource {
             try {
                 Assert-WindowsSourceDrive -DriveRoot $driveLetter
             } catch {
-                Write-Output $_.Exception.Message
+                Write-Host $_.Exception.Message
                 $driveLetter = $null
                 continue
             }
-            Write-Output "Using mounted drive $driveLetter"
+            Write-Host "Using mounted drive $driveLetter"
         } elseif ((Test-Path -LiteralPath $userInput -PathType Leaf) -and ($userInput -match '\.iso$')) {
             try {
                 $mount = Mount-IsoAndGetDriveLetter -ImagePath $userInput
@@ -603,7 +603,7 @@ function Resolve-WindowsSource {
                 $driveLetter = $mount.DriveRoot
                 Assert-WindowsSourceDrive -DriveRoot $driveLetter
             } catch {
-                Write-Output $_.Exception.Message
+                Write-Host $_.Exception.Message
                 if ($script:ImagePath) {
                     Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
                 }
@@ -613,9 +613,9 @@ function Resolve-WindowsSource {
                 continue
             }
             $script:MountedByScript = $true
-            Write-Output "Mounted $($script:ImagePath) at $driveLetter"
+            Write-Host "Mounted $($script:ImagePath) at $driveLetter"
         } else {
-            Write-Output "Invalid input. Provide a drive letter (e.g. E) or a path to a .iso file."
+            Write-Host "Invalid input. Provide a drive letter (e.g. E) or a path to a .iso file."
             $driveLetter = $null
         }
     } while (-not $driveLetter)
