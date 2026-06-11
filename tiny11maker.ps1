@@ -221,6 +221,20 @@ function Assert-WindowsSourceDrive {
     }
 }
 
+function Show-WindowsImageMenu {
+    param([array]$Images)
+    Write-Host ''
+    Write-Host 'Available Windows images:' -ForegroundColor Cyan
+    foreach ($img in ($Images | Sort-Object ImageIndex)) {
+        $label = $img.ImageName
+        if ($img.ImageDescription -and $img.ImageDescription -ne $img.ImageName) {
+            $label = "$label — $($img.ImageDescription)"
+        }
+        Write-Host ("  [{0,2}]  {1}" -f $img.ImageIndex, $label)
+    }
+    Write-Host ''
+}
+
 function Resolve-InstallImageIndex {
     param(
         [string]$ImagePath,
@@ -232,28 +246,32 @@ function Resolve-InstallImageIndex {
     }
     $indexes = @($images | ForEach-Object { $_.ImageIndex })
     if ($null -ne $PreferredIndex -and ($indexes -contains $PreferredIndex)) {
-        Write-Host "Using image index $PreferredIndex from earlier selection."
+        $selected = $images | Where-Object { $_.ImageIndex -eq $PreferredIndex } | Select-Object -First 1
+        Write-Host "Using image index $PreferredIndex from earlier selection: $($selected.ImageName)"
         return $PreferredIndex
     }
-    if ($indexes.Count -eq 1) {
-        Write-Host "Only one image found; using index $($indexes[0])."
-        return $indexes[0]
+    if ($images.Count -eq 1) {
+        Show-WindowsImageMenu -Images $images
+        Write-Host "Only one image found; using index $($images[0].ImageIndex): $($images[0].ImageName)"
+        return $images[0].ImageIndex
     }
     $index = $null
     while ($indexes -notcontains $index) {
-        Get-WindowsImage -ImagePath $ImagePath
-        $rawIndex = Read-Host "Please enter the image index"
+        Show-WindowsImageMenu -Images $images
+        $rawIndex = Read-Host 'Enter the image index number from the list above'
         $parsedIndex = 0
         if (-not [int]::TryParse($rawIndex, [ref]$parsedIndex)) {
-            Write-Host "Invalid index. Enter one of: $($indexes -join ', ')"
+            Write-Host "Invalid input. Enter a number from the list, e.g. $($indexes -join ', ')"
             continue
         }
         if ($indexes -notcontains $parsedIndex) {
-            Write-Host "Index $parsedIndex is not available. Enter one of: $($indexes -join ', ')"
+            Write-Host "Index $parsedIndex is not available. Choose one of: $($indexes -join ', ')"
             continue
         }
         $index = $parsedIndex
     }
+    $chosen = $images | Where-Object { $_.ImageIndex -eq $index } | Select-Object -First 1
+    Write-Host "Selected index $index`: $($chosen.ImageName)"
     return $index
 }
 
@@ -707,11 +725,12 @@ if ($script:MountedByScript -and $script:ImagePath) {
     $script:ImagePath = $null
     Write-Output "Source ISO unmounted after copy."
 }
-Set-ItemProperty -Path "$ScratchDisk\tiny11\sources\install.esd" -Name IsReadOnly -Value $false -ErrorAction 'Continue' | Out-Null
-Remove-Item "$ScratchDisk\tiny11\sources\install.esd" -ErrorAction 'Continue' | Out-Null
+if (Test-Path "$ScratchDisk\tiny11\sources\install.esd") {
+    Set-ItemProperty -Path "$ScratchDisk\tiny11\sources\install.esd" -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue | Out-Null
+    Remove-Item "$ScratchDisk\tiny11\sources\install.esd" -Force -ErrorAction SilentlyContinue | Out-Null
+}
 Write-Output "Copy complete!"
-Start-Sleep -Seconds 2
-Clear-Host
+Write-Output ""
 Write-Output "Getting image information:"
 $index = Resolve-InstallImageIndex -ImagePath $ScratchDisk\tiny11\sources\install.wim -PreferredIndex $selectedImageIndex
 Write-Output "Mounting Windows image. This may take a while."
