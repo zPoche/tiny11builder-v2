@@ -35,7 +35,9 @@
 
 #---------[ Parameters ]---------#
 param (
+    [Parameter(Position = 0)]
     [string]$ISO,
+    [Parameter(Position = 1)]
     [ValidatePattern('^[c-zC-Z]$')][string]$SCRATCH,
     [switch]$Custom
 )
@@ -130,6 +132,8 @@ function Invoke-ScriptCleanupOnFailure {
     Unload-LoadedRegistries
     if ($script:MountedByScript -and $script:ImagePath) {
         Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
+        $script:MountedByScript = $false
+        $script:ImagePath = $null
     }
     if ($ScratchDisk -and (Test-Path "$ScratchDisk\scratchdir")) {
         try {
@@ -220,9 +224,28 @@ function Resolve-InstallImageIndex {
     $index = $null
     while ($indexes -notcontains $index) {
         Get-WindowsImage -ImagePath $ImagePath
-        $index = [int](Read-Host "Please enter the image index")
+        $rawIndex = Read-Host "Please enter the image index"
+        $parsedIndex = 0
+        if (-not [int]::TryParse($rawIndex, [ref]$parsedIndex)) {
+            Write-Output "Invalid index. Enter one of: $($indexes -join ', ')"
+            continue
+        }
+        $index = $parsedIndex
     }
     return $index
+}
+
+function Assert-IsoBootFiles {
+    param([string]$ImageRoot)
+    $requiredFiles = @(
+        "$ImageRoot\boot\etfsboot.com",
+        "$ImageRoot\efi\microsoft\boot\efisys.bin"
+    )
+    foreach ($file in $requiredFiles) {
+        if (-not (Test-Path $file)) {
+            throw "Missing boot file required for ISO creation: $file"
+        }
+    }
 }
 
 function Set-RegistryValue {
@@ -355,6 +378,10 @@ function Test-Prerequisites {
         throw "removePackage.txt was not found in $PSScriptRoot"
     }
 
+    if (-not (Test-Path "$PSScriptRoot\autounattend.xml")) {
+        throw "autounattend.xml was not found in $PSScriptRoot"
+    }
+
     Write-Output "Prerequisites OK."
 }
 
@@ -409,27 +436,34 @@ function Initialize-Oscdimg {
     $ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$adkArch\Oscdimg"
     $localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
 
+    $oscdimgPath = $null
     if ([System.IO.Directory]::Exists($ADKDepTools)) {
         Write-Output "Will be using oscdimg.exe from system ADK."
-        return "$ADKDepTools\oscdimg.exe"
-    }
-
-    Write-Output "ADK folder not found. Creating/using local copy of oscdimg.exe."
-    $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
-
-    if (-not (Test-Path -Path $localOSCDIMGPath)) {
-        Write-Output "Downloading oscdimg.exe..."
-        Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
-
-        if (-not (Test-Path $localOSCDIMGPath)) {
-            throw "Failed to download oscdimg.exe."
-        }
-        Write-Output "oscdimg.exe downloaded successfully."
+        $oscdimgPath = "$ADKDepTools\oscdimg.exe"
     } else {
-        Write-Output "oscdimg.exe already exists locally."
+        Write-Output "ADK folder not found. Creating/using local copy of oscdimg.exe."
+        $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
+
+        if (-not (Test-Path -Path $localOSCDIMGPath)) {
+            Write-Output "Downloading oscdimg.exe..."
+            Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
+
+            if (-not (Test-Path $localOSCDIMGPath)) {
+                throw "Failed to download oscdimg.exe."
+            }
+            Write-Output "oscdimg.exe downloaded successfully."
+        } else {
+            Write-Output "oscdimg.exe already exists locally."
+        }
+
+        $oscdimgPath = $localOSCDIMGPath
     }
 
-    return $localOSCDIMGPath
+    if (-not (Test-Path $oscdimgPath)) {
+        throw "oscdimg.exe not found at $oscdimgPath"
+    }
+
+    return $oscdimgPath
 }
 
 function Resolve-WindowsSource {
@@ -544,10 +578,6 @@ if (! $myWindowsPrincipal.IsInRole($adminRole)) {
     exit
 }
 
-if (-not (Test-Path -Path "$PSScriptRoot\autounattend.xml")) {
-    throw "autounattend.xml not found in $PSScriptRoot. Ensure it is present before running the script."
-}
-
 Start-Transcript -Path "$PSScriptRoot\tiny11_$(get-date -f yyyyMMdd_HHmms).log"
 
 trap {
@@ -625,6 +655,7 @@ if ($languageLine) {
 
 $imageInfo = & 'dism' '/English' '/Get-WimInfo' "/wimFile:$($ScratchDisk)\tiny11\sources\install.wim" "/index:$index"
 $lines = $imageInfo -split '\r?\n'
+$architecture = $null
 
 foreach ($line in $lines) {
     if ($line -like '*Architecture : *') {
@@ -868,6 +899,9 @@ if (-not (Test-Path "$ScratchDisk\tiny11\sources\install2.wim")) {
 }
 Remove-Item -Path "$ScratchDisk\tiny11\sources\install.wim" -Force | Out-Null
 Rename-Item -Path "$ScratchDisk\tiny11\sources\install2.wim" -NewName "install.wim" | Out-Null
+if (-not (Test-Path "$ScratchDisk\tiny11\sources\install.wim")) {
+    throw "Failed to replace install.wim after export."
+}
 $index = 1
 Write-Output "Windows image completed. Continuing with boot.wim."
 Start-Sleep -Seconds 2
@@ -913,6 +947,7 @@ Clear-Host
 Write-Output "The tiny11 image is now completed. Proceeding with the making of the ISO..."
 Write-Output "Copying unattended file for bypassing MS account on OOBE..."
 Copy-AutounattendWithIndex -SourcePath $autounattendSource -DestinationPath "$ScratchDisk\tiny11\autounattend.xml" -ImageIndex 1
+Assert-IsoBootFiles -ImageRoot "$ScratchDisk\tiny11"
 Write-Output "Creating ISO image..."
 
 & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$ScratchDisk\tiny11\boot\etfsboot.com#pEF,e,b$ScratchDisk\tiny11\efi\microsoft\boot\efisys.bin" "$ScratchDisk\tiny11" "$PSScriptRoot\tiny11.iso"

@@ -48,6 +48,9 @@ function Test-CoremakerPrerequisites {
     if (-not (Test-Path "$PSScriptRoot\removePackage.txt")) {
         throw "removePackage.txt was not found in $PSScriptRoot"
     }
+    if (-not (Test-Path "$PSScriptRoot\autounattend.xml")) {
+        throw "autounattend.xml was not found in $PSScriptRoot"
+    }
     Write-Host "Prerequisites OK."
 }
 
@@ -194,9 +197,28 @@ function Resolve-InstallImageIndex {
     $index = $null
     while ($indexes -notcontains $index) {
         Get-WindowsImage -ImagePath $ImagePath
-        $index = [int](Read-Host "Please enter the image index")
+        $rawIndex = Read-Host "Please enter the image index"
+        $parsedIndex = 0
+        if (-not [int]::TryParse($rawIndex, [ref]$parsedIndex)) {
+            Write-Host "Invalid index. Enter one of: $($indexes -join ', ')"
+            continue
+        }
+        $index = $parsedIndex
     }
     return $index
+}
+
+function Assert-IsoBootFiles {
+    param([string]$ImageRoot)
+    $requiredFiles = @(
+        "$ImageRoot\boot\etfsboot.com",
+        "$ImageRoot\efi\microsoft\boot\efisys.bin"
+    )
+    foreach ($file in $requiredFiles) {
+        if (-not (Test-Path $file)) {
+            throw "Missing boot file required for ISO creation: $file"
+        }
+    }
 }
 
 function Set-RegistryValue {
@@ -223,19 +245,25 @@ function Initialize-Oscdimg {
     $adkArch = switch ($HostArchitecture) { 'AMD64' { 'amd64' } 'ARM64' { 'arm64' } default { $HostArchitecture.ToLowerInvariant() } }
     $ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$adkArch\Oscdimg"
     $localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
+    $oscdimgPath = $null
     if ([System.IO.Directory]::Exists($ADKDepTools)) {
         Write-Host "Will be using oscdimg.exe from system ADK."
-        return "$ADKDepTools\oscdimg.exe"
-    }
-    if (-not (Test-Path -Path $localOSCDIMGPath)) {
-        Write-Host "Downloading oscdimg.exe..."
-        $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
-        Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
-        if (-not (Test-Path $localOSCDIMGPath)) {
-            throw "Failed to download oscdimg.exe."
+        $oscdimgPath = "$ADKDepTools\oscdimg.exe"
+    } else {
+        if (-not (Test-Path -Path $localOSCDIMGPath)) {
+            Write-Host "Downloading oscdimg.exe..."
+            $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
+            Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
+            if (-not (Test-Path $localOSCDIMGPath)) {
+                throw "Failed to download oscdimg.exe."
+            }
         }
+        $oscdimgPath = $localOSCDIMGPath
     }
-    return $localOSCDIMGPath
+    if (-not (Test-Path $oscdimgPath)) {
+        throw "oscdimg.exe not found at $oscdimgPath"
+    }
+    return $oscdimgPath
 }
 
 if ((Get-ExecutionPolicy) -eq 'Restricted') {
@@ -277,10 +305,6 @@ trap {
 
 Write-Host "Welcome to tiny11 core builder! BETA 09-05-25"
 Write-Host "This script generates a significantly reduced Windows 11 image. However, it's not suitable for regular use due to its lack of serviceability - you can't add languages, updates, or features post-creation. tiny11 Core is not a full Windows 11 substitute but a rapid testing or development tool, potentially useful for VM environments."
-if (-not (Test-Path "$PSScriptRoot\autounattend.xml")) {
-    throw "autounattend.xml not found in $PSScriptRoot. Ensure it is present before running the script."
-}
-
 Write-Host "Do you want to continue? (y/n)"
 do {
     $continueChoice = (Read-Host).Trim().ToLowerInvariant()
@@ -364,6 +388,7 @@ if ($languageLine) {
 
 $imageInfo = & 'dism' '/English' '/Get-WimInfo' "/wimFile:$($env:SystemDrive)\tiny11\sources\install.wim" "/index:$index"
 $lines = $imageInfo -split '\r?\n'
+$architecture = $null
 
 foreach ($line in $lines) {
     if ($line -like '*Architecture : *') {
@@ -770,6 +795,9 @@ if (-not (Test-Path "$mainOSDrive\tiny11\sources\install2.wim")) {
 }
 Remove-Item -Path "$mainOSDrive\tiny11\sources\install.wim" -Force | Out-Null
 Rename-Item -Path "$mainOSDrive\tiny11\sources\install2.wim" -NewName "install.wim" | Out-Null
+if (-not (Test-Path "$mainOSDrive\tiny11\sources\install.wim")) {
+    throw "Failed to replace install.wim after export."
+}
 $index = 1
 Write-Host "Windows image completed. Continuing with boot.wim."
 Start-Sleep -Seconds 2
@@ -818,6 +846,7 @@ if (-not (Test-Path "$mainOSDrive\tiny11\sources\install.esd")) {
 Remove-Item "$mainOSDrive\tiny11\sources\install.wim" -ErrorAction SilentlyContinue | Out-Null
 Write-Host "The tiny11 image is now completed. Proceeding with the making of the ISO..."
 Copy-AutounattendWithIndex -SourcePath $autounattendSource -DestinationPath "$mainOSDrive\tiny11\autounattend.xml" -ImageIndex 1
+Assert-IsoBootFiles -ImageRoot "$mainOSDrive\tiny11"
 Write-Host "Creating ISO image..."
 & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$mainOSDrive\tiny11\boot\etfsboot.com#pEF,e,b$mainOSDrive\tiny11\efi\microsoft\boot\efisys.bin" "$mainOSDrive\tiny11" "$PSScriptRoot\tiny11.iso"
 Assert-CommandExitCode -Label 'oscdimg ISO creation'
