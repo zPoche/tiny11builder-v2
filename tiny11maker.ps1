@@ -175,7 +175,18 @@ function Copy-AutounattendWithIndex {
     )
     $xml = Get-Content -Path $SourcePath -Raw
     $xml = $xml -replace '(<Key>/IMAGE/INDEX</Key>\s*<Value>)\d+(</Value>)', "`${1}${ImageIndex}`${2}"
-    Set-Content -Path $DestinationPath -Value $xml -Encoding UTF8
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($DestinationPath, $xml, $utf8NoBom)
+}
+
+function Assert-WindowsSourceDrive {
+    param([string]$DriveRoot)
+    if (-not (Test-Path "$DriveRoot\sources\boot.wim")) {
+        throw "Drive $DriveRoot does not contain sources\boot.wim. Mount a valid Windows 11 ISO."
+    }
+    if (-not (Test-Path "$DriveRoot\sources\install.wim") -and -not (Test-Path "$DriveRoot\sources\install.esd")) {
+        throw "Drive $DriveRoot does not contain sources\install.wim or install.esd."
+    }
 }
 
 function Set-RegistryValue {
@@ -378,9 +389,7 @@ function Resolve-WindowsSource {
     if ($IsoParameter) {
         if ($IsoParameter -match '^[c-zC-Z]$') {
             $driveLetter = $IsoParameter + ":"
-            if (-not (Test-Path "$driveLetter\sources\boot.wim")) {
-                throw "Drive $driveLetter does not contain sources\boot.wim. Mount a valid Windows 11 ISO."
-            }
+            Assert-WindowsSourceDrive -DriveRoot $driveLetter
             Write-Output "Using mounted drive $driveLetter"
             return $driveLetter
         }
@@ -391,6 +400,7 @@ function Resolve-WindowsSource {
                 throw "ISO mounted but no drive letter was assigned."
             }
             $driveLetter = $vol.DriveLetter + ":"
+            Assert-WindowsSourceDrive -DriveRoot $driveLetter
             $script:MountedByScript = $true
             Write-Output "Mounted $($script:ImagePath) at $driveLetter"
             return $driveLetter
@@ -403,8 +413,10 @@ function Resolve-WindowsSource {
         $userInput = $userInput.Trim() -replace '"', ''
         if ($userInput -match '^[c-zC-Z]$') {
             $driveLetter = $userInput + ":"
-            if (-not (Test-Path "$driveLetter\sources\boot.wim")) {
-                Write-Output "Drive $driveLetter does not contain sources\boot.wim. Try another drive or ISO path."
+            try {
+                Assert-WindowsSourceDrive -DriveRoot $driveLetter
+            } catch {
+                Write-Output $_.Exception.Message
                 $driveLetter = $null
                 continue
             }
@@ -420,6 +432,16 @@ function Resolve-WindowsSource {
                 continue
             }
             $driveLetter = $vol.DriveLetter + ":"
+            try {
+                Assert-WindowsSourceDrive -DriveRoot $driveLetter
+            } catch {
+                Write-Output $_.Exception.Message
+                Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
+                $script:ImagePath = $null
+                $script:MountedByScript = $false
+                $driveLetter = $null
+                continue
+            }
             $script:MountedByScript = $true
             Write-Output "Mounted $($script:ImagePath) at $driveLetter"
         } else {
@@ -504,9 +526,12 @@ if (-not (Test-Path "$ScratchDisk\tiny11\sources\install.wim")) {
         Write-Output ' '
         Write-Output 'Converting install.esd to install.wim. This may take a while...'
         Export-WindowsImage -SourceImagePath "$ScratchDisk\tiny11\sources\install.esd" -SourceIndex $esdIndex -DestinationImagePath "$ScratchDisk\tiny11\sources\install.wim" -CompressionType Maximum -CheckIntegrity
-    } elseif (-not (Test-Path "$ScratchDisk\tiny11\sources\boot.wim")) {
-        throw "Can't find Windows OS Installation files in the specified source. Provide a valid Windows 11 ISO or mounted drive."
+    } else {
+        throw "Can't find install.wim or install.esd in the copied source. Provide a valid Windows 11 ISO or mounted drive."
     }
+}
+if (-not (Test-Path "$ScratchDisk\tiny11\sources\install.wim")) {
+    throw "install.wim is missing after copy/conversion. The source may be incomplete."
 }
 if ($MountedByScript -and $ImagePath) {
     Dismount-DiskImage -ImagePath $ImagePath -ErrorAction SilentlyContinue | Out-Null

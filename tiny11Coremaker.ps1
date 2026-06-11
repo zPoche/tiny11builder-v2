@@ -149,7 +149,18 @@ function Copy-AutounattendWithIndex {
     )
     $xml = Get-Content -Path $SourcePath -Raw
     $xml = $xml -replace '(<Key>/IMAGE/INDEX</Key>\s*<Value>)\d+(</Value>)', "`${1}${ImageIndex}`${2}"
-    Set-Content -Path $DestinationPath -Value $xml -Encoding UTF8
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($DestinationPath, $xml, $utf8NoBom)
+}
+
+function Assert-WindowsSourceDrive {
+    param([string]$DriveRoot)
+    if (-not (Test-Path "$DriveRoot\sources\boot.wim")) {
+        throw "Drive $DriveRoot does not contain sources\boot.wim."
+    }
+    if (-not (Test-Path "$DriveRoot\sources\install.wim") -and -not (Test-Path "$DriveRoot\sources\install.esd")) {
+        throw "Drive $DriveRoot does not contain sources\install.wim or install.esd."
+    }
 }
 
 function Set-RegistryValue {
@@ -257,10 +268,11 @@ do {
     $driveInput = (Read-Host "Please enter the drive letter for the Windows 11 image").Trim() -replace ':$', ''
     if ($driveInput -match '^[c-zC-Z]$') {
         $candidate = $driveInput + ":"
-        if ((Test-Path "$candidate\sources\boot.wim") -or (Test-Path "$candidate\sources\install.wim") -or (Test-Path "$candidate\sources\install.esd")) {
+        try {
+            Assert-WindowsSourceDrive -DriveRoot $candidate
             $DriveLetter = $candidate
-        } else {
-            Write-Host "Drive $candidate does not contain a Windows 11 image (expected sources\boot.wim and install.wim or install.esd)."
+        } catch {
+            Write-Host $_.Exception.Message
             $DriveLetter = $null
         }
     } else {
@@ -286,12 +298,12 @@ if (-not (Test-Path "$mainOSDrive\tiny11\sources\install.wim")) {
         Write-Host ' '
         Write-Host 'Converting install.esd to install.wim. This may take a while...'
         Export-WindowsImage -SourceImagePath "$mainOSDrive\tiny11\sources\install.esd" -SourceIndex $esdIndex -DestinationImagePath "$mainOSDrive\tiny11\sources\install.wim" -CompressionType Maximum -CheckIntegrity
-    } elseif (-not (Test-Path "$mainOSDrive\tiny11\sources\boot.wim")) {
-        Write-Host "Can't find Windows OS Installation files in the specified drive letter."
-        Write-Host "Please enter the correct DVD drive letter."
-        Stop-Transcript -ErrorAction SilentlyContinue
-        exit 1
+    } else {
+        throw "Can't find install.wim or install.esd in the copied source. Enter the correct DVD drive letter."
     }
+}
+if (-not (Test-Path "$mainOSDrive\tiny11\sources\install.wim")) {
+    throw "install.wim is missing after copy/conversion. The source may be incomplete."
 }
 Set-ItemProperty -Path "$mainOSDrive\tiny11\sources\install.esd" -Name IsReadOnly -Value $false -ErrorAction 'Continue' | Out-Null
 Remove-Item "$mainOSDrive\tiny11\sources\install.esd" -ErrorAction 'Continue' | Out-Null
