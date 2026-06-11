@@ -281,8 +281,8 @@ if ($architecture -eq "amd64") {
     # Specify the list of files to copy
      $dirsToCopy = @(
         "arm64_microsoft-windows-servicingstack-onecore_31bf3856ad364e35_*",
-        "Catalogs"
-        "FileMaps"
+        "Catalogs",
+        "FileMaps",
         "Fusion"
         "InstallTemp"
         "Manifests"
@@ -328,7 +328,7 @@ foreach ($dir in $dirsToCopy) {
 Write-Host "Deleting WinSxS. This may take a while..."
         Remove-Item -Path $mainOSDrive\scratchdir\Windows\WinSxS -Recurse -Force
 
-Rename-Item -Path $mainOSDrive\scratchdir\Windows\WinSxS_edit -NewName $mainOSDrive\scratchdir\Windows\WinSxS
+Rename-Item -Path "$mainOSDrive\scratchdir\Windows\WinSxS_edit" -NewName "WinSxS"
 Write-Host "Complete!"
 
 Write-Host "Loading registry..."

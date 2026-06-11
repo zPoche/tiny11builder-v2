@@ -236,6 +236,10 @@ function Resolve-WindowsSource {
         if ((Test-Path $IsoParameter -PathType Leaf) -and ($IsoParameter -match '\.iso$')) {
             $script:ImagePath = $IsoParameter
             $vol = Mount-DiskImage -ImagePath $script:ImagePath -Access ReadOnly -PassThru | Get-Volume
+            if (-not $vol.DriveLetter) {
+                Write-Error "ISO mounted but no drive letter was assigned."
+                exit 1
+            }
             $driveLetter = $vol.DriveLetter + ":"
             $script:MountedByScript = $true
             Write-Output "Mounted $($script:ImagePath) at $driveLetter"
@@ -246,14 +250,21 @@ function Resolve-WindowsSource {
     }
 
     do {
-        $input = Read-Host "Enter Windows 11 ISO path or mounted drive letter"
-        $input = $input.Trim() -replace '"', ''
-        if ($input -match '^[c-zC-Z]$') {
-            $driveLetter = $input + ":"
+        $userInput = Read-Host "Enter Windows 11 ISO path or mounted drive letter"
+        $userInput = $userInput.Trim() -replace '"', ''
+        if ($userInput -match '^[c-zC-Z]$') {
+            $driveLetter = $userInput + ":"
             Write-Output "Using mounted drive $driveLetter"
-        } elseif ((Test-Path $input -PathType Leaf) -and ($input -match '\.iso$')) {
-            $script:ImagePath = $input
+        } elseif ((Test-Path $userInput -PathType Leaf) -and ($userInput -match '\.iso$')) {
+            $script:ImagePath = $userInput
             $vol = Mount-DiskImage -ImagePath $script:ImagePath -Access ReadOnly -PassThru | Get-Volume
+            if (-not $vol.DriveLetter) {
+                Write-Output "ISO mounted but no drive letter was assigned. Try mounting manually or use a different ISO."
+                Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
+                $script:ImagePath = $null
+                $driveLetter = $null
+                continue
+            }
             $driveLetter = $vol.DriveLetter + ":"
             $script:MountedByScript = $true
             Write-Output "Mounted $($script:ImagePath) at $driveLetter"
@@ -342,6 +353,7 @@ Write-Output "Copy complete!"
 Start-Sleep -Seconds 2
 Clear-Host
 Write-Output "Getting image information:"
+$index = $null
 $ImagesIndex = (Get-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\install.wim).ImageIndex
 while ($ImagesIndex -notcontains $index) {
     Get-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\install.wim
