@@ -46,10 +46,21 @@ $ErrorActionPreference = 'Stop'
 $WarningPreference = 'Continue'
 $InformationPreference = 'Continue'
 
+if ($ISO) {
+    $ISO = $ISO.Trim().Trim('"').TrimEnd(':')
+}
+if ($SCRATCH) {
+    $SCRATCH = $SCRATCH.Trim().TrimEnd(':')
+}
+
 if (-not $SCRATCH) {
     $ScratchDisk = $PSScriptRoot -replace '[\\]+$', ''
 } else {
     $ScratchDisk = $SCRATCH + ":"
+}
+
+if ($ISO -and $SCRATCH -and ($ISO -match '^[c-zC-Z]$') -and ($ISO.ToUpperInvariant() -eq $SCRATCH.ToUpperInvariant())) {
+    throw "ISO source drive and SCRATCH drive must be different."
 }
 
 #---------[ Functions ]---------#
@@ -189,8 +200,15 @@ function Copy-AutounattendWithIndex {
     if ($xml -notmatch "<Key>/IMAGE/INDEX</Key>\s*<Value>$ImageIndex</Value>") {
         throw "Failed to patch /IMAGE/INDEX to $ImageIndex in autounattend source."
     }
+    $destDir = Split-Path -Path $DestinationPath -Parent
+    if ($destDir -and -not (Test-Path $destDir)) {
+        New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+    }
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllText($DestinationPath, $xml, $utf8NoBom)
+    if (-not (Test-Path $DestinationPath)) {
+        throw "Failed to write autounattend to $DestinationPath"
+    }
 }
 
 function Assert-WindowsSourceDrive {
@@ -230,9 +248,27 @@ function Resolve-InstallImageIndex {
             Write-Output "Invalid index. Enter one of: $($indexes -join ', ')"
             continue
         }
+        if ($indexes -notcontains $parsedIndex) {
+            Write-Output "Index $parsedIndex is not available. Enter one of: $($indexes -join ', ')"
+            continue
+        }
         $index = $parsedIndex
     }
     return $index
+}
+
+function Initialize-ScratchWorkspace {
+    param([string]$ScratchRoot)
+    $scratchDir = Join-Path $ScratchRoot 'scratchdir'
+    if (-not (Test-Path $scratchDir)) {
+        return
+    }
+    $mounted = @(Get-WindowsImage -Mounted -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $scratchDir })
+    if ($mounted.Count -gt 0) {
+        Write-Output "Dismounting leftover scratch image from a previous run..."
+        Dismount-WindowsImage -Path $scratchDir -Discard -ErrorAction Stop
+    }
+    Remove-Item -Path $scratchDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 function Assert-IsoBootFiles {
@@ -505,7 +541,7 @@ function Resolve-WindowsSource {
 
     do {
         $userInput = Read-Host "Enter Windows 11 ISO path or mounted drive letter"
-        $userInput = $userInput.Trim() -replace '"', ''
+        $userInput = $userInput.Trim().Trim('"').TrimEnd(':')
         if ($userInput -match '^[c-zC-Z]$') {
             $driveLetter = $userInput + ":"
             try {
@@ -599,6 +635,7 @@ if ($SCRATCH) {
 }
 Test-ScratchDiskSpace -ScratchPath $ScratchDisk
 $OSCDIMG = Initialize-Oscdimg -HostArchitecture $hostArchitecture
+Initialize-ScratchWorkspace -ScratchRoot $ScratchDisk
 
 New-Item -ItemType Directory -Force -Path "$ScratchDisk\tiny11\sources" | Out-Null
 $DriveLetter = Resolve-WindowsSource -IsoParameter $ISO
@@ -606,6 +643,9 @@ $selectedImageIndex = $null
 
 Write-Output "Copying Windows image..."
 Copy-Item -Path "$DriveLetter\*" -Destination "$ScratchDisk\tiny11" -Recurse -Force | Out-Null
+if (-not (Test-Path "$ScratchDisk\tiny11\sources\boot.wim")) {
+    throw "boot.wim is missing from the copied source. The ISO may be incomplete."
+}
 
 if (-not (Test-Path "$ScratchDisk\tiny11\sources\install.wim")) {
     if (Test-Path "$ScratchDisk\tiny11\sources\install.esd") {
@@ -904,6 +944,7 @@ if (-not (Test-Path "$ScratchDisk\tiny11\sources\install.wim")) {
 }
 $index = 1
 Write-Output "Windows image completed. Continuing with boot.wim."
+Initialize-ScratchWorkspace -ScratchRoot $ScratchDisk
 Start-Sleep -Seconds 2
 Clear-Host
 Write-Output "Mounting boot image:"

@@ -162,8 +162,15 @@ function Copy-AutounattendWithIndex {
     if ($xml -notmatch "<Key>/IMAGE/INDEX</Key>\s*<Value>$ImageIndex</Value>") {
         throw "Failed to patch /IMAGE/INDEX to $ImageIndex in autounattend source."
     }
+    $destDir = Split-Path -Path $DestinationPath -Parent
+    if ($destDir -and -not (Test-Path $destDir)) {
+        New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+    }
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllText($DestinationPath, $xml, $utf8NoBom)
+    if (-not (Test-Path $DestinationPath)) {
+        throw "Failed to write autounattend to $DestinationPath"
+    }
 }
 
 function Assert-WindowsSourceDrive {
@@ -203,9 +210,27 @@ function Resolve-InstallImageIndex {
             Write-Host "Invalid index. Enter one of: $($indexes -join ', ')"
             continue
         }
+        if ($indexes -notcontains $parsedIndex) {
+            Write-Host "Index $parsedIndex is not available. Enter one of: $($indexes -join ', ')"
+            continue
+        }
         $index = $parsedIndex
     }
     return $index
+}
+
+function Initialize-ScratchWorkspace {
+    param([string]$ScratchRoot)
+    $scratchDir = Join-Path $ScratchRoot 'scratchdir'
+    if (-not (Test-Path $scratchDir)) {
+        return
+    }
+    $mounted = @(Get-WindowsImage -Mounted -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $scratchDir })
+    if ($mounted.Count -gt 0) {
+        Write-Host "Dismounting leftover scratch image from a previous run..."
+        Dismount-WindowsImage -Path $scratchDir -Discard -ErrorAction Stop
+    }
+    Remove-Item -Path $scratchDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 function Assert-IsoBootFiles {
@@ -323,6 +348,7 @@ $hostArchitecture = $Env:PROCESSOR_ARCHITECTURE
 Test-CoremakerPrerequisites
 Test-ScratchDiskSpace -ScratchPath $mainOSDrive
 $OSCDIMG = Initialize-Oscdimg -HostArchitecture $hostArchitecture
+Initialize-ScratchWorkspace -ScratchRoot $mainOSDrive
 New-Item -ItemType Directory -Force -Path "$mainOSDrive\tiny11\sources" | Out-Null
 do {
     $driveInput = (Read-Host "Please enter the drive letter for the Windows 11 image").Trim() -replace ':$', ''
@@ -344,6 +370,9 @@ do {
 $selectedImageIndex = $null
 Write-Host "Copying Windows image..."
 Copy-Item -Path "$DriveLetter\*" -Destination "$mainOSDrive\tiny11" -Recurse -Force | Out-Null
+if (-not (Test-Path "$mainOSDrive\tiny11\sources\boot.wim")) {
+    throw "boot.wim is missing from the copied source. The ISO may be incomplete."
+}
 
 if (-not (Test-Path "$mainOSDrive\tiny11\sources\install.wim")) {
     if (Test-Path "$mainOSDrive\tiny11\sources\install.esd") {
@@ -800,6 +829,7 @@ if (-not (Test-Path "$mainOSDrive\tiny11\sources\install.wim")) {
 }
 $index = 1
 Write-Host "Windows image completed. Continuing with boot.wim."
+Initialize-ScratchWorkspace -ScratchRoot $mainOSDrive
 Start-Sleep -Seconds 2
 Clear-Host
 Write-Host "Mounting boot image:"
