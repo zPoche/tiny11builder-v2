@@ -7,7 +7,6 @@
                 <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
                 <NetworkLocation>Home</NetworkLocation>
                 <ProtectYourPC>3</ProtectYourPC>
-                <SkipUserOOBE>true</SkipUserOOBE>
                 <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
             </OOBE>
         </component>

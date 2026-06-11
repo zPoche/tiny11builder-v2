@@ -82,6 +82,34 @@ function Invoke-DismChecked {
     Assert-CommandExitCode -Label $Label
 }
 
+function Format-ProcessArgument {
+    param([string]$Argument)
+    if ($Argument -match '\s') {
+        return '"' + $Argument.Replace('"', '""') + '"'
+    }
+    return $Argument
+}
+
+function Build-ProcessArgumentString {
+    param([string[]]$Arguments)
+    return ($Arguments | ForEach-Object { Format-ProcessArgument $_ }) -join ' '
+}
+
+function Invoke-RegLoad {
+    param(
+        [string]$HiveName,
+        [string]$FilePath
+    )
+    reg load "HKLM\$HiveName" $FilePath
+    Assert-CommandExitCode -Label "reg load HKLM\$HiveName"
+}
+
+function Invoke-RegUnload {
+    param([string]$HiveName)
+    reg unload "HKLM\$HiveName"
+    Assert-CommandExitCode -Label "reg unload HKLM\$HiveName"
+}
+
 function Set-RegistryValue {
     param (
         [string]$path,
@@ -352,14 +380,12 @@ $myWindowsPrincipal = new-object System.Security.Principal.WindowsPrincipal($myW
 $adminRole = [System.Security.Principal.WindowsBuiltInRole]::Administrator
 if (! $myWindowsPrincipal.IsInRole($adminRole)) {
     Write-Output "Restarting Tiny11 image creator as admin in a new window, you can close this one."
-    $argList = @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$PSCommandPath`""
-    )
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', $PSCommandPath)
     if ($ISO) { $argList += @('-ISO', $ISO) }
     if ($SCRATCH) { $argList += @('-SCRATCH', $SCRATCH) }
     if ($Custom) { $argList += '-Custom' }
     $newProcess = new-object System.Diagnostics.ProcessStartInfo "PowerShell"
-    $newProcess.Arguments = $argList -join ' '
+    $newProcess.Arguments = Build-ProcessArgumentString -Arguments $argList
     $newProcess.Verb = "runas"
     [System.Diagnostics.Process]::Start($newProcess) | Out-Null
     exit
@@ -540,11 +566,11 @@ Write-Output "Removal complete!"
 Start-Sleep -Seconds 2
 Clear-Host
 Write-Output "Loading registry..."
-reg load HKLM\zCOMPONENTS $ScratchDisk\scratchdir\Windows\System32\config\COMPONENTS | Out-Null
-reg load HKLM\zDEFAULT $ScratchDisk\scratchdir\Windows\System32\config\default | Out-Null
-reg load HKLM\zNTUSER $ScratchDisk\scratchdir\Users\Default\ntuser.dat | Out-Null
-reg load HKLM\zSOFTWARE $ScratchDisk\scratchdir\Windows\System32\config\SOFTWARE | Out-Null
-reg load HKLM\zSYSTEM $ScratchDisk\scratchdir\Windows\System32\config\SYSTEM | Out-Null
+Invoke-RegLoad -HiveName 'zCOMPONENTS' -FilePath "$ScratchDisk\scratchdir\Windows\System32\config\COMPONENTS"
+Invoke-RegLoad -HiveName 'zDEFAULT' -FilePath "$ScratchDisk\scratchdir\Windows\System32\config\default"
+Invoke-RegLoad -HiveName 'zNTUSER' -FilePath "$ScratchDisk\scratchdir\Users\Default\ntuser.dat"
+Invoke-RegLoad -HiveName 'zSOFTWARE' -FilePath "$ScratchDisk\scratchdir\Windows\System32\config\SOFTWARE"
+Invoke-RegLoad -HiveName 'zSYSTEM' -FilePath "$ScratchDisk\scratchdir\Windows\System32\config\SYSTEM"
 Write-Output "Bypassing system requirements(on the system image):"
 Set-RegistryValue 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' 'SV1' 'REG_DWORD' '0'
 Set-RegistryValue 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' 'SV2' 'REG_DWORD' '0'
@@ -662,11 +688,11 @@ Remove-Item -Path "$tasksPath\Microsoft\Windows\Chkdsk\Proxy" -Force -ErrorActio
 Remove-Item -Path "$tasksPath\Microsoft\Windows\Windows Error Reporting\QueueReporting" -Force -ErrorAction SilentlyContinue
 Write-Host "Task files have been deleted."
 Write-Host "Unmounting Registry..."
-reg unload HKLM\zCOMPONENTS | Out-Null
-reg unload HKLM\zDEFAULT | Out-Null
-reg unload HKLM\zNTUSER | Out-Null
-reg unload HKLM\zSOFTWARE | Out-Null
-reg unload HKLM\zSYSTEM | Out-Null
+Invoke-RegUnload -HiveName 'zCOMPONENTS'
+Invoke-RegUnload -HiveName 'zDEFAULT'
+Invoke-RegUnload -HiveName 'zNTUSER'
+Invoke-RegUnload -HiveName 'zSOFTWARE'
+Invoke-RegUnload -HiveName 'zSYSTEM'
 Write-Output "Cleaning up image..."
 Invoke-DismChecked -Label 'DISM cleanup' /Image:$ScratchDisk\scratchdir /Cleanup-Image /StartComponentCleanup /ResetBase
 Write-Output "Cleanup complete."
@@ -687,11 +713,11 @@ $wimFilePath = "$ScratchDisk\tiny11\sources\boot.wim"
 Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false
 Mount-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\boot.wim -Index 2 -Path $ScratchDisk\scratchdir
 Write-Output "Loading registry..."
-reg load HKLM\zCOMPONENTS $ScratchDisk\scratchdir\Windows\System32\config\COMPONENTS
-reg load HKLM\zDEFAULT $ScratchDisk\scratchdir\Windows\System32\config\default
-reg load HKLM\zNTUSER $ScratchDisk\scratchdir\Users\Default\ntuser.dat
-reg load HKLM\zSOFTWARE $ScratchDisk\scratchdir\Windows\System32\config\SOFTWARE
-reg load HKLM\zSYSTEM $ScratchDisk\scratchdir\Windows\System32\config\SYSTEM
+Invoke-RegLoad -HiveName 'zCOMPONENTS' -FilePath "$ScratchDisk\scratchdir\Windows\System32\config\COMPONENTS"
+Invoke-RegLoad -HiveName 'zDEFAULT' -FilePath "$ScratchDisk\scratchdir\Windows\System32\config\default"
+Invoke-RegLoad -HiveName 'zNTUSER' -FilePath "$ScratchDisk\scratchdir\Users\Default\ntuser.dat"
+Invoke-RegLoad -HiveName 'zSOFTWARE' -FilePath "$ScratchDisk\scratchdir\Windows\System32\config\SOFTWARE"
+Invoke-RegLoad -HiveName 'zSYSTEM' -FilePath "$ScratchDisk\scratchdir\Windows\System32\config\SYSTEM"
 
 Write-Output "Bypassing system requirements(on the setup image):"
 Set-RegistryValue 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' 'SV1' 'REG_DWORD' '0'
@@ -707,11 +733,11 @@ Set-RegistryValue 'HKLM\zSYSTEM\Setup\MoSetup' 'AllowUpgradesWithUnsupportedTPMO
 Write-Output "Tweaking complete!"
 
 Write-Output "Unmounting Registry..."
-reg unload HKLM\zCOMPONENTS | Out-Null
-reg unload HKLM\zDEFAULT | Out-Null
-reg unload HKLM\zNTUSER | Out-Null
-reg unload HKLM\zSOFTWARE | Out-Null
-reg unload HKLM\zSYSTEM | Out-Null
+Invoke-RegUnload -HiveName 'zCOMPONENTS'
+Invoke-RegUnload -HiveName 'zDEFAULT'
+Invoke-RegUnload -HiveName 'zNTUSER'
+Invoke-RegUnload -HiveName 'zSOFTWARE'
+Invoke-RegUnload -HiveName 'zSYSTEM'
 
 Write-Output "Unmounting image..."
 Dismount-WindowsImage -Path $ScratchDisk\scratchdir -Save

@@ -129,6 +129,8 @@ You should replace the Capability with the one returned of course.
 ---
 
 ## Known issues:
+- `autounattend.xml` is configured for **amd64** only. arm64 ISO builds need an architecture-specific answer file.
+- `tiny11Coremaker.ps1` does not support `-Custom` debloat or ISO auto-mount (use `tiny11maker.ps1` for those features).
 - Although Edge is removed, there are some remnants in the Settings, but the app in itself is deleted. 
 - You might have to update Winget before being able to install any apps, using Microsoft Store.
 - Outlook and Dev Home might reappear after some time. This is an ongoing battle, though the latest script update tries to prevent this more aggressively.

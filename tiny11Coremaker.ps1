@@ -1,3 +1,91 @@
+$ErrorActionPreference = 'Stop'
+
+function Assert-CommandExitCode {
+    param(
+        [string]$Label,
+        [int[]]$AllowedExitCodes = @(0)
+    )
+    if ($AllowedExitCodes -notcontains $LASTEXITCODE) {
+        throw "$Label failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Format-ProcessArgument {
+    param([string]$Argument)
+    if ($Argument -match '\s') {
+        return '"' + $Argument.Replace('"', '""') + '"'
+    }
+    return $Argument
+}
+
+function Build-ProcessArgumentString {
+    param([string[]]$Arguments)
+    return ($Arguments | ForEach-Object { Format-ProcessArgument $_ }) -join ' '
+}
+
+function Test-CoremakerPrerequisites {
+    Write-Host "Checking prerequisites..."
+    if (-not (Get-Command 'dism.exe' -ErrorAction SilentlyContinue)) {
+        throw "DISM was not found. Install the Windows ADK or run on a Windows edition with deployment tools."
+    }
+    foreach ($cmd in @('Mount-WindowsImage', 'Dismount-WindowsImage', 'Get-WindowsImage')) {
+        if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
+            throw "Required cmdlet '$cmd' was not found."
+        }
+    }
+    Write-Host "Prerequisites OK."
+}
+
+function Test-ScratchDiskSpace {
+    param(
+        [string]$ScratchPath,
+        [uint64]$RequiredBytes = 20GB
+    )
+    $driveName = (Get-Item $ScratchPath).PSDrive.Name
+    $freeBytes = (Get-PSDrive -Name $driveName).Free
+    $requiredGb = [math]::Round($RequiredBytes / 1GB)
+    $freeGb = [math]::Round($freeBytes / 1GB, 1)
+    Write-Host "Scratch disk ${driveName}: free space ${freeGb} GB (required: ${requiredGb} GB)"
+    if ($freeBytes -lt $RequiredBytes) {
+        throw "Insufficient free space on ${driveName}:. Need at least ${requiredGb} GB, but only ${freeGb} GB is available."
+    }
+}
+
+function Invoke-RegLoad {
+    param(
+        [string]$HiveName,
+        [string]$FilePath
+    )
+    reg load "HKLM\$HiveName" $FilePath
+    Assert-CommandExitCode -Label "reg load HKLM\$HiveName"
+}
+
+function Invoke-RegUnload {
+    param([string]$HiveName)
+    reg unload "HKLM\$HiveName"
+    Assert-CommandExitCode -Label "reg unload HKLM\$HiveName"
+}
+
+function Initialize-Oscdimg {
+    param([string]$HostArchitecture)
+    $adkArch = switch ($HostArchitecture) { 'AMD64' { 'amd64' } 'ARM64' { 'arm64' } default { $HostArchitecture.ToLowerInvariant() } }
+    $ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$adkArch\Oscdimg"
+    $localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
+    if ([System.IO.Directory]::Exists($ADKDepTools)) {
+        Write-Host "Will be using oscdimg.exe from system ADK."
+        return "$ADKDepTools\oscdimg.exe"
+    }
+    if (-not (Test-Path -Path $localOSCDIMGPath)) {
+        Write-Host "Downloading oscdimg.exe..."
+        $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
+        Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
+        if (-not (Test-Path $localOSCDIMGPath)) {
+            throw "Failed to download oscdimg.exe."
+        }
+    }
+    return $localOSCDIMGPath
+}
+
 if ((Get-ExecutionPolicy) -eq 'Restricted') {
     Write-Host "Your current PowerShell Execution Policy is set to Restricted, which prevents scripts from running. Do you want to change it to RemoteSigned? (yes/no)"
     $response = Read-Host
@@ -18,27 +106,37 @@ $adminRole=[System.Security.Principal.WindowsBuiltInRole]::Administrator
 if (! $myWindowsPrincipal.IsInRole($adminRole))
 {
     Write-Host "Restarting Tiny11 image creator as admin in a new window, you can close this one."
-    $newProcess = new-object System.Diagnostics.ProcessStartInfo "PowerShell";
-    $newProcess.Arguments = "-NoProfile -ExecutionPolicy Bypass -NoExit -File `"$($myInvocation.MyCommand.Definition)`"";
-    $newProcess.Verb = "runas";
-    [System.Diagnostics.Process]::Start($newProcess);
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', $PSCommandPath)
+    $newProcess = new-object System.Diagnostics.ProcessStartInfo "PowerShell"
+    $newProcess.Arguments = Build-ProcessArgumentString -Arguments $argList
+    $newProcess.Verb = "runas"
+    [System.Diagnostics.Process]::Start($newProcess) | Out-Null
     exit
 }
-Start-Transcript -Path "$PSScriptRoot\tiny11.log" 
-# Ask the user for input
+Start-Transcript -Path "$PSScriptRoot\tiny11.log"
+
+trap {
+    Write-Error "Script failed: $($_.Exception.Message)"
+    Read-Host "Press Enter to exit"
+    exit 1
+}
+
 Write-Host "Welcome to tiny11 core builder! BETA 09-05-25"
 Write-Host "This script generates a significantly reduced Windows 11 image. However, it's not suitable for regular use due to its lack of serviceability - you can't add languages, updates, or features post-creation. tiny11 Core is not a full Windows 11 substitute but a rapid testing or development tool, potentially useful for VM environments."
 Write-Host "Do you want to continue? (y/n)"
-$input = Read-Host
+$continueChoice = Read-Host
 
-if ($input -eq 'y') {
+if ($continueChoice -eq 'y') {
     Write-Host "Off we go..."
 Start-Sleep -Seconds 3
 Clear-Host
 
 $mainOSDrive = $env:SystemDrive
 $hostArchitecture = $Env:PROCESSOR_ARCHITECTURE
-New-Item -ItemType Directory -Force -Path "$mainOSDrive\tiny11\sources" >null
+Test-CoremakerPrerequisites
+Test-ScratchDiskSpace -ScratchPath $mainOSDrive
+$OSCDIMG = Initialize-Oscdimg -HostArchitecture $hostArchitecture
+New-Item -ItemType Directory -Force -Path "$mainOSDrive\tiny11\sources" | Out-Null
 $DriveLetter = Read-Host "Please enter the drive letter for the Windows 11 image"
 $DriveLetter = $DriveLetter + ":"
 
@@ -58,7 +156,7 @@ if ((Test-Path "$DriveLetter\sources\boot.wim") -eq $false -or (Test-Path "$Driv
 }
 
 Write-Host "Copying Windows image..."
-Copy-Item -Path "$DriveLetter\*" -Destination "$mainOSDrive\tiny11" -Recurse -Force > null
+Copy-Item -Path "$DriveLetter\*" -Destination "$mainOSDrive\tiny11" -Recurse -Force | Out-Null
 Set-ItemProperty -Path "$mainOSDrive\tiny11\sources\install.esd" -Name IsReadOnly -Value $false > $null 2>&1
 Remove-Item "$mainOSDrive\tiny11\sources\install.esd" > $null 2>&1
 Write-Host "Copy complete!"
@@ -167,40 +265,40 @@ foreach ($packagePattern in $packagePatterns) {
 }
 
 Write-Host "Do you want to enable .NET 3.5? This cannot be done after the image has been created! (y/n)"
-$input = Read-Host
+$dotnetChoice = Read-Host
 
-if ($input -eq 'y') {
+if ($dotnetChoice -eq 'y') {
     Write-Host "Enabling .NET 3.5..."
     & 'dism'  "/image:$scratchDir" '/enable-feature' '/featurename:NetFX3' '/All' "/source:$($env:SystemDrive)\tiny11\sources\sxs" 
     Write-Host ".NET 3.5 has been enabled."
 }
-elseif ($input -eq 'n') {
+elseif ($dotnetChoice -eq 'n') {
     Write-Host "You chose not to enable .NET 3.5. Continuing..."
 }
 else {
     Write-Host "Invalid input. Please enter 'y' to enable .NET 3.5 or 'n' to continue without installing .net 3.5."
 }
 Write-Host "Removing Edge:"
-Remove-Item -Path "$mainOSDrive\scratchdir\Program Files (x86)\Microsoft\Edge" -Recurse -Force >null
-Remove-Item -Path "$mainOSDrive\scratchdir\Program Files (x86)\Microsoft\EdgeUpdate" -Recurse -Force >null
-Remove-Item -Path "$mainOSDrive\scratchdir\Program Files (x86)\Microsoft\EdgeCore" -Recurse -Force >null
+Remove-Item -Path "$mainOSDrive\scratchdir\Program Files (x86)\Microsoft\Edge" -Recurse -Force | Out-Null
+Remove-Item -Path "$mainOSDrive\scratchdir\Program Files (x86)\Microsoft\EdgeUpdate" -Recurse -Force | Out-Null
+Remove-Item -Path "$mainOSDrive\scratchdir\Program Files (x86)\Microsoft\EdgeCore" -Recurse -Force | Out-Null
 if ($architecture -eq 'amd64') {
     $folderPath = Get-ChildItem -Path "$mainOSDrive\scratchdir\Windows\WinSxS" -Filter "amd64_microsoft-edge-webview_31bf3856ad364e35*" -Directory | Select-Object -ExpandProperty FullName
 
     if ($folderPath) {
-        & 'takeown' '/f' $folderPath '/r' >null
-        & icacls $folderPath  "/grant" "$($adminGroup.Value):(F)" '/T' '/C' >null
-        Remove-Item -Path $folderPath -Recurse -Force >null
+        & 'takeown' '/f' $folderPath '/r' | Out-Null
+        & icacls $folderPath  "/grant" "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
+        Remove-Item -Path $folderPath -Recurse -Force | Out-Null
     } else {
         Write-Host "Folder not found."
     }
 } elseif ($architecture -eq 'arm64') {
-    $folderPath = Get-ChildItem -Path "$mainOSDrive\scratchdir\Windows\WinSxS" -Filter "arm64_microsoft-edge-webview_31bf3856ad364e35*" -Directory | Select-Object -ExpandProperty FullName >null
+    $folderPath = Get-ChildItem -Path "$mainOSDrive\scratchdir\Windows\WinSxS" -Filter "arm64_microsoft-edge-webview_31bf3856ad364e35*" -Directory | Select-Object -ExpandProperty FullName | Out-Null
 
     if ($folderPath) {
-        & 'takeown' '/f' $folderPath '/r'>null
-        & icacls $folderPath  "/grant" "$($adminGroup.Value):(F)" '/T' '/C' >null
-        Remove-Item -Path $folderPath -Recurse -Force >null
+        & 'takeown' '/f' $folderPath '/r'| Out-Null
+        & icacls $folderPath  "/grant" "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
+        Remove-Item -Path $folderPath -Recurse -Force | Out-Null
     } else {
         Write-Host "Folder not found."
     }
@@ -216,9 +314,9 @@ Write-Host "Removing WinRE"
 Remove-Item -Path "$mainOSDrive\scratchdir\Windows\System32\Recovery\winre.wim" -Recurse -Force
 New-Item -Path "$mainOSDrive\scratchdir\Windows\System32\Recovery\winre.wim" -ItemType File -Force
 Write-Host "Removing OneDrive:"
-& 'takeown' '/f' "$mainOSDrive\scratchdir\Windows\System32\OneDriveSetup.exe" >null
-& 'icacls' "$mainOSDrive\scratchdir\Windows\System32\OneDriveSetup.exe" '/grant' "$($adminGroup.Value):(F)" '/T' '/C' >null
-Remove-Item -Path "$mainOSDrive\scratchdir\Windows\System32\OneDriveSetup.exe" -Force >null
+& 'takeown' '/f' "$mainOSDrive\scratchdir\Windows\System32\OneDriveSetup.exe" | Out-Null
+& 'icacls' "$mainOSDrive\scratchdir\Windows\System32\OneDriveSetup.exe" '/grant' "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
+Remove-Item -Path "$mainOSDrive\scratchdir\Windows\System32\OneDriveSetup.exe" -Force | Out-Null
 Write-Host "Removal complete!"
 Start-Sleep -Seconds 2
 Clear-Host
@@ -268,17 +366,8 @@ if ($architecture -eq "amd64") {
         "x86_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*",
         "x86_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*"
     )
- # Copy each directory
-   foreach ($dir in $dirsToCopy) {
-        $sourceDirs = Get-ChildItem -Path $sourceDirectory -Filter $dir -Directory
-        foreach ($sourceDir in $sourceDirs) {
-            $destDir = Join-Path -Path $destinationDirectory -ChildPath $sourceDir.Name
-            Write-Host "Copying $sourceDir.FullName to $destDir"
-            Copy-Item -Path $sourceDir.FullName -Destination $destDir -Recurse -Force
-        }
-    }
 }
- elseif ($architecture -eq "arm64") {
+elseif ($architecture -eq "arm64") {
     # Specify the list of files to copy
      $dirsToCopy = @(
         "arm64_microsoft-windows-servicingstack-onecore_31bf3856ad364e35_*",
@@ -315,16 +404,18 @@ if ($architecture -eq "amd64") {
         "arm64_microsoft-windows-servicingstack-inetsrv_31bf3856ad364e35_*",
         "arm64_microsoft-windows-servicingstack-msg_31bf3856ad364e35_*"
     )
+} else {
+    throw "Unsupported architecture for WinSxS trimming: $architecture"
 }
-foreach ($dir in $dirsToCopy) {
-        $sourceDirs = Get-ChildItem -Path $sourceDirectory -Filter $dir -Directory
-        foreach ($sourceDir in $sourceDirs) {
-            $destDir = Join-Path -Path $destinationDirectory -ChildPath $sourceDir.Name
-            Write-Host "Copying $sourceDir.FullName to $destDir"
-            Copy-Item -Path $sourceDir.FullName -Destination $destDir -Recurse -Force
-        }
-    }  
 
+foreach ($dir in $dirsToCopy) {
+    $sourceDirs = Get-ChildItem -Path $sourceDirectory -Filter $dir -Directory
+    foreach ($sourceDir in $sourceDirs) {
+        $destDir = Join-Path -Path $destinationDirectory -ChildPath $sourceDir.Name
+        Write-Host "Copying $sourceDir.FullName to $destDir"
+        Copy-Item -Path $sourceDir.FullName -Destination $destDir -Recurse -Force
+    }
+}
 
 Write-Host "Deleting WinSxS. This may take a while..."
         Remove-Item -Path $mainOSDrive\scratchdir\Windows\WinSxS -Recurse -Force
@@ -333,11 +424,11 @@ Rename-Item -Path "$mainOSDrive\scratchdir\Windows\WinSxS_edit" -NewName "WinSxS
 Write-Host "Complete!"
 
 Write-Host "Loading registry..."
-reg load HKLM\zCOMPONENTS $mainOSDrive\scratchdir\Windows\System32\config\COMPONENTS | Out-Null
-reg load HKLM\zDEFAULT $mainOSDrive\scratchdir\Windows\System32\config\default | Out-Null
-reg load HKLM\zNTUSER $mainOSDrive\scratchdir\Users\Default\ntuser.dat | Out-Null
-reg load HKLM\zSOFTWARE $mainOSDrive\scratchdir\Windows\System32\config\SOFTWARE | Out-Null
-reg load HKLM\zSYSTEM $mainOSDrive\scratchdir\Windows\System32\config\SYSTEM | Out-Null
+Invoke-RegLoad -HiveName 'zCOMPONENTS' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\COMPONENTS"
+Invoke-RegLoad -HiveName 'zDEFAULT' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\default"
+Invoke-RegLoad -HiveName 'zNTUSER' -FilePath "$mainOSDrive\scratchdir\Users\Default\ntuser.dat"
+Invoke-RegLoad -HiveName 'zSOFTWARE' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\SOFTWARE"
+Invoke-RegLoad -HiveName 'zSYSTEM' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\SYSTEM"
 Write-Host "Bypassing system requirements(on the system image):"
 & 'reg' 'add' 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV1' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
 & 'reg' 'add' 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV2' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
@@ -473,108 +564,79 @@ foreach ($path in $servicePaths) {
 & 'reg' 'add' 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' '/v' 'SettingsPageVisibility' '/t' 'REG_SZ' '/d' 'hide:virus;windowsupdate' '/f' 
 Write-Host "Tweaking complete!"
 Write-Host "Unmounting Registry..."
-reg unload HKLM\zCOMPONENTS >null
-reg unload HKLM\zDEFAULT >null
-reg unload HKLM\zNTUSER >null
-reg unload HKLM\zSOFTWARE
-reg unload HKLM\zSYSTEM >null
+Invoke-RegUnload -HiveName 'zCOMPONENTS'
+Invoke-RegUnload -HiveName 'zDEFAULT'
+Invoke-RegUnload -HiveName 'zNTUSER'
+Invoke-RegUnload -HiveName 'zSOFTWARE'
+Invoke-RegUnload -HiveName 'zSYSTEM'
 Write-Host "Cleaning up image..."
-& 'dism' '/English' "/image:$mainOSDrive\scratchdir" '/Cleanup-Image' '/StartComponentCleanup' '/ResetBase' >null
+& 'dism' '/English' "/image:$mainOSDrive\scratchdir" '/Cleanup-Image' '/StartComponentCleanup' '/ResetBase' | Out-Null
 Write-Host "Cleanup complete."
 Write-Host ' '
 Write-Host "Unmounting image..."
 & 'dism' '/English' '/unmount-image' "/mountdir:$mainOSDrive\scratchdir" '/commit'
 Write-Host "Exporting image..."
 & 'dism' '/English' '/Export-Image' "/SourceImageFile:$mainOSDrive\tiny11\sources\install.wim" "/SourceIndex:$index" "/DestinationImageFile:$mainOSDrive\tiny11\sources\install2.wim" '/compress:max'
-Remove-Item -Path "$mainOSDrive\tiny11\sources\install.wim" -Force >null
-Rename-Item -Path "$mainOSDrive\tiny11\sources\install2.wim" -NewName "install.wim" >null
+Remove-Item -Path "$mainOSDrive\tiny11\sources\install.wim" -Force | Out-Null
+Rename-Item -Path "$mainOSDrive\tiny11\sources\install2.wim" -NewName "install.wim" | Out-Null
 Write-Host "Windows image completed. Continuing with boot.wim."
 Start-Sleep -Seconds 2
 Clear-Host
 Write-Host "Mounting boot image:"
 $wimFilePath = "$($env:SystemDrive)\tiny11\sources\boot.wim" 
-& takeown "/F" $wimFilePath >null
+& takeown "/F" $wimFilePath | Out-Null
 & icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
 Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false
 & 'dism' '/English' '/mount-image' "/imagefile:$mainOSDrive\tiny11\sources\boot.wim" '/index:2' "/mountdir:$mainOSDrive\scratchdir"
 Write-Host "Loading registry..."
-reg load HKLM\zCOMPONENTS $mainOSDrive\scratchdir\Windows\System32\config\COMPONENTS
-reg load HKLM\zDEFAULT $mainOSDrive\scratchdir\Windows\System32\config\default
-reg load HKLM\zNTUSER $mainOSDrive\scratchdir\Users\Default\ntuser.dat
-reg load HKLM\zSOFTWARE $mainOSDrive\scratchdir\Windows\System32\config\SOFTWARE
-reg load HKLM\zSYSTEM $mainOSDrive\scratchdir\Windows\System32\config\SYSTEM
+Invoke-RegLoad -HiveName 'zCOMPONENTS' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\COMPONENTS"
+Invoke-RegLoad -HiveName 'zDEFAULT' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\default"
+Invoke-RegLoad -HiveName 'zNTUSER' -FilePath "$mainOSDrive\scratchdir\Users\Default\ntuser.dat"
+Invoke-RegLoad -HiveName 'zSOFTWARE' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\SOFTWARE"
+Invoke-RegLoad -HiveName 'zSYSTEM' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\SYSTEM"
 Write-Host "Bypassing system requirements(on the setup image):"
-& 'reg' 'add' 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV1' '/t' 'REG_DWORD' '/d' '0' '/f' >null
-& 'reg' 'add' 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV2' '/t' 'REG_DWORD' '/d' '0' '/f' >null
-& 'reg' 'add' 'HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV1' '/t' 'REG_DWORD' '/d' '0' '/f' >null
-& 'reg' 'add' 'HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV2' '/t' 'REG_DWORD' '/d' '0' '/f' >null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassCPUCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassRAMCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassSecureBootCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassStorageCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassTPMCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\MoSetup' '/v' 'AllowUpgradesWithUnsupportedTPMOrCPU' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-& 'reg' 'add' 'HKEY_LOCAL_MACHINE\zSYSTEM\Setup' '/v' 'CmdLine' '/t' 'REG_SZ' '/d' 'X:\sources\setup.exe' '/f' >null
+& 'reg' 'add' 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV1' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
+& 'reg' 'add' 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV2' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
+& 'reg' 'add' 'HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV1' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
+& 'reg' 'add' 'HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV2' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
+& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassCPUCheck' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
+& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassRAMCheck' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
+& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassSecureBootCheck' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
+& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassStorageCheck' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
+& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassTPMCheck' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
+& 'reg' 'add' 'HKLM\zSYSTEM\Setup\MoSetup' '/v' 'AllowUpgradesWithUnsupportedTPMOrCPU' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
+& 'reg' 'add' 'HKEY_LOCAL_MACHINE\zSYSTEM\Setup' '/v' 'CmdLine' '/t' 'REG_SZ' '/d' 'X:\sources\setup.exe' '/f' | Out-Null
 Write-Host "Tweaking complete!"
 Write-Host "Unmounting Registry..."
-reg unload HKLM\zCOMPONENTS >null
-reg unload HKLM\zDEFAULT >null
-reg unload HKLM\zNTUSER >null
-reg unload HKLM\zSOFTWARE >null
-reg unload HKLM\zSYSTEM >null
+Invoke-RegUnload -HiveName 'zCOMPONENTS'
+Invoke-RegUnload -HiveName 'zDEFAULT'
+Invoke-RegUnload -HiveName 'zNTUSER'
+Invoke-RegUnload -HiveName 'zSOFTWARE'
+Invoke-RegUnload -HiveName 'zSYSTEM'
 Write-Host "Unmounting image..."
 & 'dism' '/English' '/unmount-image' "/mountdir:$mainOSDrive\scratchdir" '/commit'
 Clear-Host
 Write-Host "Exporting ESD. This may take a while..."
 & dism /Export-Image /SourceImageFile:"$mainOSDrive\tiny11\sources\install.wim" /SourceIndex:1 /DestinationImageFile:"$mainOSDrive\tiny11\sources\install.esd" /Compress:recovery
-Remove-Item "$mainOSDrive\tiny11\sources\install.wim" > $null 2>&1
+Remove-Item "$mainOSDrive\tiny11\sources\install.wim" -ErrorAction SilentlyContinue | Out-Null
 Write-Host "The tiny11 image is now completed. Proceeding with the making of the ISO..."
 Write-Host "Creating ISO image..."
-$adkArch = switch ($hostArchitecture) { 'AMD64' { 'amd64' } 'ARM64' { 'arm64' } default { $hostArchitecture.ToLowerInvariant() } }
-$ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$adkArch\Oscdimg"
-$localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
-
-if ([System.IO.Directory]::Exists($ADKDepTools)) {
-    Write-Host "Will be using oscdimg.exe from system ADK."
-    $OSCDIMG = "$ADKDepTools\oscdimg.exe"
-} else {
-    Write-Host "ADK folder not found. Will be using bundled oscdimg.exe."
-    
-    
-    $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
-
-    if (-not (Test-Path -Path $localOSCDIMGPath)) {
-        Write-Host "Downloading oscdimg.exe..."
-        Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
-
-        if (Test-Path $localOSCDIMGPath) {
-            Write-Host "oscdimg.exe downloaded successfully."
-        } else {
-            Write-Error "Failed to download oscdimg.exe."
-            exit 1
-        }
-    } else {
-        Write-Host "oscdimg.exe already exists locally."
-    }
-
-    $OSCDIMG = $localOSCDIMGPath
-}
-
 & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$mainOSDrive\tiny11\boot\etfsboot.com#pEF,e,b$mainOSDrive\tiny11\efi\microsoft\boot\efisys.bin" "$mainOSDrive\tiny11" "$PSScriptRoot\tiny11.iso"
+Assert-CommandExitCode -Label 'oscdimg ISO creation'
 
 # Finishing up
 Write-Host "Creation completed! Press any key to exit the script..."
 Read-Host "Press Enter to continue"
 Write-Host "Performing Cleanup..."
-Remove-Item -Path "$mainOSDrive\tiny11" -Recurse -Force >null
-Remove-Item -Path "$mainOSDrive\scratchdir" -Recurse -Force >null
+Remove-Item -Path "$mainOSDrive\tiny11" -Recurse -Force | Out-Null
+Remove-Item -Path "$mainOSDrive\scratchdir" -Recurse -Force | Out-Null
 
 # Stop the transcript
 Stop-Transcript
 
 exit
 }
-elseif ($input -eq 'n') {
+elseif ($continueChoice -eq 'n') {
     Write-Host "You chose not to continue. The script will now exit."
     exit
 }
