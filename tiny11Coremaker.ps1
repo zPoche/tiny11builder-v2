@@ -201,7 +201,7 @@ function Show-WindowsImageMenu {
     foreach ($img in ($Images | Sort-Object ImageIndex)) {
         $label = $img.ImageName
         if ($img.ImageDescription -and $img.ImageDescription -ne $img.ImageName) {
-            $label = "$label — $($img.ImageDescription)"
+            $label = "$label - $($img.ImageDescription)"
         }
         Write-Host ("  [{0,2}]  {1}" -f $img.ImageIndex, $label)
     }
