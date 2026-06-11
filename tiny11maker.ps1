@@ -8,30 +8,36 @@
     The only executable included is oscdimg.exe, which is provided in the Windows ADK and it is used to create bootable ISO images.
 
 .PARAMETER ISO
-    Drive letter given to the mounted iso (eg: E)
+    Drive letter of the mounted Windows 11 ISO (e.g. E), or omit to be prompted for an ISO path or drive letter.
 
 .PARAMETER SCRATCH
     Drive letter of the desired scratch disk (eg: D)
     NOTE: The SCRATCH drive must support file/folder security (i.e., must be, e.g., NTFS filesystem).
 
+.PARAMETER Custom
+    Enable interactive selection of which apps to remove. Without this flag, all packages listed in
+    removePackage.txt are removed (default behaviour).
+
 .EXAMPLE
+    .\tiny11maker.ps1
     .\tiny11maker.ps1 E D
     .\tiny11maker.ps1 -ISO E -SCRATCH D
     .\tiny11maker.ps1 -SCRATCH D -ISO E
-    .\tiny11maker.ps1
+    .\tiny11maker.ps1 -ISO E -SCRATCH D -Custom
 
-    *If you ordinal parameters the first one must be the mounted iso. The second is the scratch drive.
+    *If you use ordinal parameters the first one must be the mounted iso. The second is the scratch drive.
     prefer the use of full named parameter (eg: "-ISO") as you can put in the order you want.
 
 .NOTES
     Auteur: ntdevlabs
-    Date: 09-07-25
+    Date: 11-06-26
 #>
 
 #---------[ Parameters ]---------#
 param (
-    [ValidatePattern('^[c-zC-Z]$')][string]$ISO,
-    [ValidatePattern('^[c-zC-Z]$')][string]$SCRATCH
+    [string]$ISO,
+    [ValidatePattern('^[c-zC-Z]$')][string]$SCRATCH,
+    [switch]$Custom
 )
 
 $ErrorActionPreference = 'Stop'
@@ -62,18 +68,205 @@ function Set-RegistryValue {
 
 function Remove-RegistryValue {
     param (
-		[string]$path
-	)
-	try {
-		& 'reg' 'delete' $path '/f' | Out-Null
-		Write-Output "Removed registry value: $path"
-	} catch {
-		Write-Output "Error removing registry value: $_"
-	}
+        [string]$path
+    )
+    try {
+        & 'reg' 'delete' $path '/f' | Out-Null
+        Write-Output "Removed registry value: $path"
+    } catch {
+        Write-Output "Error removing registry value: $_"
+    }
+}
+
+function Show-PackageSelector {
+    param(
+        [string[]]$Items
+    )
+
+    $selected = @{}
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        $selected[$i] = $true
+    }
+
+    while ($true) {
+        Clear-Host
+        Write-Host "Select packages to REMOVE from the image:" -ForegroundColor Cyan
+        Write-Host "Toggle items by entering numbers separated by commas. Commands: all, none" -ForegroundColor DarkGray
+        Write-Host "Tip: use ranges like 1-5 or combinations like 1,3,7-9" -ForegroundColor DarkGray
+        Write-Host "use: q / quit / exit to abort - use: 'done' if the selection is ready to proceed" -ForegroundColor DarkGreen
+        Write-Host ""
+
+        for ($i = 0; $i -lt $Items.Count; $i++) {
+            $mark = if ($selected[$i]) { '[X]' } else { '[ ]' }
+            $num = ($i + 1).ToString().PadLeft(3)
+            Write-Host "$num $mark  $($Items[$i])"
+        }
+
+        Write-Host ""
+        $selectionInput = Read-Host "Enter selection"
+        if (-not $selectionInput) { continue }
+
+        $selectionInput = $selectionInput.Trim()
+        $lower = $selectionInput.ToLowerInvariant()
+        if ($lower -in @('q', 'quit', 'exit')) {
+            Write-Host "Exiting selection and keeping current choices." -ForegroundColor Yellow
+            break
+        }
+        if ($lower -eq 'done') { break }
+        if ($lower -eq 'all') {
+            for ($i = 0; $i -lt $Items.Count; $i++) { $selected[$i] = $true }
+            continue
+        }
+        if ($lower -eq 'none') {
+            for ($i = 0; $i -lt $Items.Count; $i++) { $selected[$i] = $false }
+            continue
+        }
+
+        $tokens = $selectionInput -split '[, ]+' | Where-Object { $_ -ne '' }
+        foreach ($t in $tokens) {
+            if ($t -match '^\d+$') {
+                $idx = [int]$t - 1
+                if ($idx -ge 0 -and $idx -lt $Items.Count) {
+                    $selected[$idx] = -not $selected[$idx]
+                } else {
+                    Write-Host "Number out of range: $t" -ForegroundColor DarkYellow
+                    Start-Sleep -Seconds 1
+                }
+            } elseif ($t -match '^(\d+)-(\d+)$') {
+                $start = [int]$Matches[1] - 1
+                $end = [int]$Matches[2] - 1
+                if ($start -lt 0) { $start = 0 }
+                if ($end -ge $Items.Count) { $end = $Items.Count - 1 }
+                if ($start -le $end) {
+                    for ($j = $start; $j -le $end; $j++) {
+                        $selected[$j] = -not $selected[$j]
+                    }
+                } else {
+                    Write-Host "Invalid range: $t" -ForegroundColor DarkYellow
+                    Start-Sleep -Seconds 1
+                }
+            } else {
+                Write-Host "Ignored token: $t" -ForegroundColor DarkYellow
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+
+    $result = for ($i = 0; $i -lt $Items.Count; $i++) {
+        if ($selected[$i]) { $Items[$i] }
+    }
+    return ,$result
+}
+
+function Test-PrefixSelected {
+    param(
+        [string[]]$SelectedPrefixes,
+        [string]$Prefix
+    )
+    return $SelectedPrefixes -contains $Prefix
+}
+
+function Test-Prerequisites {
+    Write-Output "Checking prerequisites..."
+
+    if (-not (Get-Command 'dism.exe' -ErrorAction SilentlyContinue)) {
+        Write-Error "DISM was not found. Install the Windows Assessment and Deployment Kit (ADK) or run on a Windows edition that includes deployment tools."
+        exit 1
+    }
+
+    foreach ($cmd in @('Mount-WindowsImage', 'Dismount-WindowsImage', 'Get-WindowsImage', 'Export-WindowsImage')) {
+        if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
+            Write-Error "Required cmdlet '$cmd' was not found. Install the DISM PowerShell module (usually included with ADK)."
+            exit 1
+        }
+    }
+
+    if (-not (Test-Path "$PSScriptRoot\removePackage.txt")) {
+        Write-Error "removePackage.txt was not found in $PSScriptRoot"
+        exit 1
+    }
+
+    Write-Output "Prerequisites OK."
+}
+
+function Initialize-Oscdimg {
+    param([string]$HostArchitecture)
+
+    Write-Output "Checking for prerequisite oscdimg.exe..."
+    $ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$HostArchitecture\Oscdimg"
+    $localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
+
+    if ([System.IO.Directory]::Exists($ADKDepTools)) {
+        Write-Output "Will be using oscdimg.exe from system ADK."
+        return "$ADKDepTools\oscdimg.exe"
+    }
+
+    Write-Output "ADK folder not found. Creating/using local copy of oscdimg.exe."
+    $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
+
+    if (-not (Test-Path -Path $localOSCDIMGPath)) {
+        Write-Output "Downloading oscdimg.exe..."
+        Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
+
+        if (-not (Test-Path $localOSCDIMGPath)) {
+            Write-Error "Failed to download oscdimg.exe."
+            exit 1
+        }
+        Write-Output "oscdimg.exe downloaded successfully."
+    } else {
+        Write-Output "oscdimg.exe already exists locally."
+    }
+
+    return $localOSCDIMGPath
+}
+
+function Resolve-WindowsSource {
+    param([string]$IsoParameter)
+
+    $script:ImagePath = $null
+    $script:MountedByScript = $false
+    $driveLetter = $null
+
+    if ($IsoParameter) {
+        if ($IsoParameter -match '^[c-zC-Z]$') {
+            $driveLetter = $IsoParameter + ":"
+            Write-Output "Using mounted drive $driveLetter"
+            return $driveLetter
+        }
+        if ((Test-Path $IsoParameter -PathType Leaf) -and ($IsoParameter -match '\.iso$')) {
+            $script:ImagePath = $IsoParameter
+            $vol = Mount-DiskImage -ImagePath $script:ImagePath -Access ReadOnly -PassThru | Get-Volume
+            $driveLetter = $vol.DriveLetter + ":"
+            $script:MountedByScript = $true
+            Write-Output "Mounted $($script:ImagePath) at $driveLetter"
+            return $driveLetter
+        }
+        Write-Error "Invalid -ISO value. Provide a drive letter (e.g. E) or a path to a .iso file."
+        exit 1
+    }
+
+    do {
+        $input = Read-Host "Enter Windows 11 ISO path or mounted drive letter"
+        $input = $input.Trim() -replace '"', ''
+        if ($input -match '^[c-zC-Z]$') {
+            $driveLetter = $input + ":"
+            Write-Output "Using mounted drive $driveLetter"
+        } elseif ((Test-Path $input -PathType Leaf) -and ($input -match '\.iso$')) {
+            $script:ImagePath = $input
+            $vol = Mount-DiskImage -ImagePath $script:ImagePath -Access ReadOnly -PassThru | Get-Volume
+            $driveLetter = $vol.DriveLetter + ":"
+            $script:MountedByScript = $true
+            Write-Output "Mounted $($script:ImagePath) at $driveLetter"
+        } else {
+            Write-Output "Invalid input. Provide a drive letter (e.g. E) or a path to a .iso file."
+            $driveLetter = $null
+        }
+    } while (-not $driveLetter)
+
+    return $driveLetter
 }
 
 #---------[ Execution ]---------#
-# Check if PowerShell execution is restricted
 if ((Get-ExecutionPolicy) -eq 'Restricted') {
     Write-Output "Your current PowerShell Execution Policy is set to Restricted, which prevents scripts from running. Do you want to change it to RemoteSigned? (yes/no)"
     $response = Read-Host
@@ -85,19 +278,23 @@ if ((Get-ExecutionPolicy) -eq 'Restricted') {
     }
 }
 
-# Check and run the script as admin if required
 $adminSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
 $adminGroup = $adminSID.Translate([System.Security.Principal.NTAccount])
-$myWindowsID=[System.Security.Principal.WindowsIdentity]::GetCurrent()
-$myWindowsPrincipal=new-object System.Security.Principal.WindowsPrincipal($myWindowsID)
-$adminRole=[System.Security.Principal.WindowsBuiltInRole]::Administrator
-if (! $myWindowsPrincipal.IsInRole($adminRole))
-{
+$myWindowsID = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$myWindowsPrincipal = new-object System.Security.Principal.WindowsPrincipal($myWindowsID)
+$adminRole = [System.Security.Principal.WindowsBuiltInRole]::Administrator
+if (! $myWindowsPrincipal.IsInRole($adminRole)) {
     Write-Output "Restarting Tiny11 image creator as admin in a new window, you can close this one."
-    $newProcess = new-object System.Diagnostics.ProcessStartInfo "PowerShell";
-    $newProcess.Arguments = "-NoProfile -ExecutionPolicy Bypass -NoExit -File `"$($myInvocation.MyCommand.Definition)`"";
-    $newProcess.Verb = "runas";
-    [System.Diagnostics.Process]::Start($newProcess);
+    $argList = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$PSCommandPath`""
+    )
+    if ($ISO) { $argList += @('-ISO', $ISO) }
+    if ($SCRATCH) { $argList += @('-SCRATCH', $SCRATCH) }
+    if ($Custom) { $argList += '-Custom' }
+    $newProcess = new-object System.Diagnostics.ProcessStartInfo "PowerShell"
+    $newProcess.Arguments = $argList -join ' '
+    $newProcess.Verb = "runas"
+    [System.Diagnostics.Process]::Start($newProcess) | Out-Null
     exit
 }
 
@@ -105,28 +302,18 @@ if (-not (Test-Path -Path "$PSScriptRoot/autounattend.xml")) {
     Invoke-RestMethod "https://raw.githubusercontent.com/ntdevlabs/tiny11builder/refs/heads/main/autounattend.xml" -OutFile "$PSScriptRoot/autounattend.xml"
 }
 
-# Start the transcript and prepare the window
 Start-Transcript -Path "$PSScriptRoot\tiny11_$(get-date -f yyyyMMdd_HHmms).log"
 
 $Host.UI.RawUI.WindowTitle = "Tiny11 image creator"
 Clear-Host
-Write-Output "Welcome to the tiny11 image creator! Release: 09-07-25"
+Write-Output "Welcome to the tiny11 image creator! Release: 11-06-26"
 
 $hostArchitecture = $Env:PROCESSOR_ARCHITECTURE
+Test-Prerequisites
+$OSCDIMG = Initialize-Oscdimg -HostArchitecture $hostArchitecture
+
 New-Item -ItemType Directory -Force -Path "$ScratchDisk\tiny11\sources" | Out-Null
-do {
-    if (-not $ISO) {
-        $DriveLetter = Read-Host "Please enter the drive letter for the Windows 11 image"
-    } else {
-        $DriveLetter = $ISO
-    }
-    if ($DriveLetter -match '^[c-zC-Z]$') {
-        $DriveLetter = $DriveLetter + ":"
-        Write-Output "Drive letter set to $DriveLetter"
-    } else {
-        Write-Output "Invalid drive letter. Please enter a letter between C and Z."
-    }
-} while ($DriveLetter -notmatch '^[c-zC-Z]:$')
+$DriveLetter = Resolve-WindowsSource -IsoParameter $ISO
 
 if ((Test-Path "$DriveLetter\sources\boot.wim") -eq $false -or (Test-Path "$DriveLetter\sources\install.wim") -eq $false) {
     if ((Test-Path "$DriveLetter\sources\install.esd") -eq $true) {
@@ -137,14 +324,18 @@ if ((Test-Path "$DriveLetter\sources\boot.wim") -eq $false -or (Test-Path "$Driv
         Write-Output 'Converting install.esd to install.wim. This may take a while...'
         Export-WindowsImage -SourceImagePath $DriveLetter\sources\install.esd -SourceIndex $index -DestinationImagePath $ScratchDisk\tiny11\sources\install.wim -Compressiontype Maximum -CheckIntegrity
     } else {
-        Write-Output "Can't find Windows OS Installation files in the specified Drive Letter.."
-        Write-Output "Please enter the correct DVD Drive Letter.."
-        exit
+        Write-Output "Can't find Windows OS Installation files in the specified source."
+        Write-Output "Please provide a valid Windows 11 ISO or mounted drive."
+        exit 1
     }
 }
 
 Write-Output "Copying Windows image..."
 Copy-Item -Path "$DriveLetter\*" -Destination "$ScratchDisk\tiny11" -Recurse -Force | Out-Null
+if ($MountedByScript -and $ImagePath) {
+    Dismount-DiskImage -ImagePath $ImagePath -ErrorAction SilentlyContinue | Out-Null
+    Write-Output "Source ISO unmounted after copy."
+}
 Set-ItemProperty -Path "$ScratchDisk\tiny11\sources\install.esd" -Name IsReadOnly -Value $false -ErrorAction 'Continue' > $null 2>&1
 Remove-Item "$ScratchDisk\tiny11\sources\install.esd" -ErrorAction 'Continue' > $null 2>&1
 Write-Output "Copy complete!"
@@ -163,8 +354,7 @@ $wimFilePath = "$ScratchDisk\tiny11\sources\install.wim"
 try {
     Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false -ErrorAction Stop
 } catch {
-    # This block will catch the error and suppress it.
-	Write-Error "$wimFilePath not found"
+    Write-Error "$wimFilePath not found"
 }
 New-Item -ItemType Directory -Force -Path "$ScratchDisk\scratchdir" > $null
 Mount-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\install.wim -Index $index -Path $ScratchDisk\scratchdir
@@ -185,7 +375,6 @@ $lines = $imageInfo -split '\r?\n'
 foreach ($line in $lines) {
     if ($line -like '*Architecture : *') {
         $architecture = $line -replace 'Architecture : ',''
-        # If the architecture is x64, replace it with amd64
         if ($architecture -eq 'x64') {
             $architecture = 'amd64'
         }
@@ -207,80 +396,58 @@ $packages = & 'dism' '/English' "/image:$($ScratchDisk)\scratchdir" '/Get-Provis
         }
     }
 
-$packagePrefixes = 'AppUp.IntelManagementandSecurityStatus',
-'Clipchamp.Clipchamp', 
-'DolbyLaboratories.DolbyAccess',
-'DolbyLaboratories.DolbyDigitalPlusDecoderOEM',
-'Microsoft.BingNews',
-'Microsoft.BingSearch',
-'Microsoft.BingWeather',
-'Microsoft.Copilot',
-'Microsoft.Windows.CrossDevice',
-'Microsoft.GamingApp',
-'Microsoft.GetHelp',
-'Microsoft.Getstarted',
-'Microsoft.Microsoft3DViewer',
-'Microsoft.MicrosoftOfficeHub',
-'Microsoft.MicrosoftSolitaireCollection',
-'Microsoft.MicrosoftStickyNotes',
-'Microsoft.MixedReality.Portal',
-'Microsoft.MSPaint',
-'Microsoft.Office.OneNote',
-'Microsoft.OfficePushNotificationUtility',
-'Microsoft.OutlookForWindows',
-'Microsoft.Paint',
-'Microsoft.People',
-'Microsoft.PowerAutomateDesktop',
-'Microsoft.SkypeApp',
-'Microsoft.StartExperiencesApp',
-'Microsoft.Todos',
-'Microsoft.Wallet',
-'Microsoft.Windows.DevHome',
-'Microsoft.Windows.Copilot',
-'Microsoft.Windows.Teams',
-'Microsoft.WindowsAlarms',
-'Microsoft.WindowsCamera',
-'microsoft.windowscommunicationsapps',
-'Microsoft.WindowsFeedbackHub',
-'Microsoft.WindowsMaps',
-'Microsoft.WindowsSoundRecorder',
-'Microsoft.WindowsTerminal',
-'Microsoft.Xbox.TCUI',
-'Microsoft.XboxApp',
-'Microsoft.XboxGameOverlay',
-'Microsoft.XboxGamingOverlay',
-'Microsoft.XboxIdentityProvider',
-'Microsoft.XboxSpeechToTextOverlay',
-'Microsoft.YourPhone',
-'Microsoft.ZuneMusic',
-'Microsoft.ZuneVideo',
-'MicrosoftCorporationII.MicrosoftFamily',
-'MicrosoftCorporationII.QuickAssist',
-'MSTeams',
-'MicrosoftTeams', 
-'Microsoft.WindowsTerminal',
-'Microsoft.549981C3F5F10',
-'Microsoft.MicrosoftEdge.Stable_8wekyb3d8bbwe!App'
+$packagePrefixes = Get-Content -Path "$PSScriptRoot\removePackage.txt" |
+    Where-Object { $_.Trim() -ne '' } |
+    ForEach-Object { $_.Trim() }
 
-$packagesToRemove = $packages | Where-Object {
-    $packageName = $_
-    $packagePrefixes -contains ($packagePrefixes | Where-Object { $packageName -like "*$_*" })
+if ($Custom) {
+    try {
+        $selectedPrefixes = Show-PackageSelector -Items $packagePrefixes
+    } catch {
+        Write-Warning "Interactive selector failed or was interrupted. Defaulting to all prefixes."
+        $selectedPrefixes = $packagePrefixes
+    }
+} else {
+    $selectedPrefixes = $packagePrefixes
 }
+
+if (-not $selectedPrefixes -or $selectedPrefixes.Count -eq 0) {
+    Write-Output "No package prefixes selected for removal. Skipping Appx package removal step."
+    $packagesToRemove = @()
+} else {
+    Write-Output "Selected package prefixes to remove:"
+    $selectedPrefixes | ForEach-Object { Write-Output " - $_" }
+
+    $packagesToRemove = $packages | Where-Object {
+        $pkg = $_
+        $match = $false
+        foreach ($pref in $selectedPrefixes) {
+            if ($pkg -like "*$pref*") { $match = $true; break }
+        }
+        $match
+    }
+}
+
 foreach ($package in $packagesToRemove) {
+    Write-Output "Removing provisioned package: $package"
     & 'dism' '/English' "/image:$($ScratchDisk)\scratchdir" '/Remove-ProvisionedAppxPackage' "/PackageName:$package"
 }
 
-Write-Output "Removing Edge:"
-Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\Edge" -Recurse -Force | Out-Null
-Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\EdgeUpdate" -Recurse -Force | Out-Null
-Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\EdgeCore" -Recurse -Force | Out-Null
-& 'takeown' '/f' "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" '/r' | Out-Null
-& 'icacls' "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" '/grant' "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
-Remove-Item -Path "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" -Recurse -Force | Out-Null
+$removeEdge = (-not $Custom) -or (Test-PrefixSelected $selectedPrefixes 'Microsoft.MicrosoftEdge.Stable_8wekyb3d8bbwe!App')
+if ($removeEdge) {
+    Write-Output "Removing Edge:"
+    Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\Edge" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+    Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\EdgeUpdate" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+    Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\EdgeCore" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+    & 'takeown' '/f' "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" '/r' | Out-Null
+    & 'icacls' "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" '/grant' "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
+    Remove-Item -Path "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+}
+
 Write-Output "Removing OneDrive:"
 & 'takeown' '/f' "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe" | Out-Null
 & 'icacls' "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe" '/grant' "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
-Remove-Item -Path "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe" -Force | Out-Null
+Remove-Item -Path "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe" -Force -ErrorAction SilentlyContinue | Out-Null
 Write-Output "Removal complete!"
 Start-Sleep -Seconds 2
 Clear-Host
@@ -336,9 +503,13 @@ Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Control\BitLocker' 'PreventDeviceE
 Write-Output "Disabling Chat icon:"
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Chat' 'ChatIcon' 'REG_DWORD' '3'
 Set-RegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarMn' 'REG_DWORD' '0'
-Write-Output "Removing Edge related registries"
-Remove-RegistryValue "HKEY_LOCAL_MACHINE\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge"
-Remove-RegistryValue "HKEY_LOCAL_MACHINE\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge Update"
+
+if ($removeEdge) {
+    Write-Output "Removing Edge related registries"
+    Remove-RegistryValue "HKEY_LOCAL_MACHINE\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge"
+    Remove-RegistryValue "HKEY_LOCAL_MACHINE\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge Update"
+}
+
 Write-Output "Disabling OneDrive folder backup"
 Set-RegistryValue "HKLM\zSOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" "REG_DWORD" "1"
 Write-Output "Disabling Search Highlights:"
@@ -363,38 +534,42 @@ if ($response -eq '' -or $response.ToLower() -eq 'y') {
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching' 'SearchOrderConfig' 'REG_DWORD' '0'
 }
 
-## Prevents installation of DevHome and Outlook
-Write-Output "Prevents installation of DevHome and Outlook:"
-Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
-Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
-Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\DevHomeUpdate' 'workCompleted' 'REG_DWORD' '1'
-Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate'
-Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\DevHomeUpdate'
-Write-Output "Disabling Copilot"
-Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 'REG_DWORD' '1'
-Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Edge' 'HubsSidebarEnabled' 'REG_DWORD' '0'
-Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 'REG_DWORD' '1'
-Write-Output "Prevents installation of Teams:"
-Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Teams' 'DisableInstallation' 'REG_DWORD' '1'
-Write-Output "Prevent installation of New Outlook:"
-Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Mail' 'PreventRun' 'REG_DWORD' '1'
+$removeDevHome = (-not $Custom) -or (Test-PrefixSelected $selectedPrefixes 'Microsoft.Windows.DevHome')
+$removeOutlook = (-not $Custom) -or (Test-PrefixSelected $selectedPrefixes 'Microsoft.OutlookForWindows')
+$removeCopilot = (-not $Custom) -or (Test-PrefixSelected $selectedPrefixes 'Microsoft.Windows.Copilot') -or (Test-PrefixSelected $selectedPrefixes 'Microsoft.Copilot')
+$removeTeams = (-not $Custom) -or (Test-PrefixSelected $selectedPrefixes 'Microsoft.Windows.Teams') -or (Test-PrefixSelected $selectedPrefixes 'MicrosoftTeams') -or (Test-PrefixSelected $selectedPrefixes 'MSTeams')
+
+if ($removeDevHome -or $removeOutlook) {
+    Write-Output "Prevents installation of DevHome and Outlook:"
+}
+if ($removeOutlook) {
+    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
+    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
+    Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate'
+    Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Mail' 'PreventRun' 'REG_DWORD' '1'
+}
+if ($removeDevHome) {
+    Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\DevHomeUpdate' 'workCompleted' 'REG_DWORD' '1'
+    Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\DevHomeUpdate'
+}
+if ($removeCopilot) {
+    Write-Output "Disabling Copilot"
+    Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 'REG_DWORD' '1'
+    Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Edge' 'HubsSidebarEnabled' 'REG_DWORD' '0'
+    Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 'REG_DWORD' '1'
+}
+if ($removeTeams) {
+    Write-Output "Prevents installation of Teams:"
+    Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Teams' 'DisableInstallation' 'REG_DWORD' '1'
+}
 
 Write-Host "Deleting scheduled task definition files..."
 $tasksPath = "$ScratchDisk\scratchdir\Windows\System32\Tasks"
 
-# Application Compatibility Appraiser
 Remove-Item -Path "$tasksPath\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser" -Force -ErrorAction SilentlyContinue
-
-# Customer Experience Improvement Program (removes the entire folder and all tasks within it)
 Remove-Item -Path "$tasksPath\Microsoft\Windows\Customer Experience Improvement Program" -Recurse -Force -ErrorAction SilentlyContinue
-
-# Program Data Updater
 Remove-Item -Path "$tasksPath\Microsoft\Windows\Application Experience\ProgramDataUpdater" -Force -ErrorAction SilentlyContinue
-
-# Chkdsk Proxy
 Remove-Item -Path "$tasksPath\Microsoft\Windows\Chkdsk\Proxy" -Force -ErrorAction SilentlyContinue
-
-# Windows Error Reporting (QueueReporting)
 Remove-Item -Path "$tasksPath\Microsoft\Windows\Windows Error Reporting\QueueReporting" -Force -ErrorAction SilentlyContinue
 Write-Host "Task files have been deleted."
 Write-Host "Unmounting Registry..."
@@ -456,46 +631,25 @@ Write-Output "The tiny11 image is now completed. Proceeding with the making of t
 Write-Output "Copying unattended file for bypassing MS account on OOBE..."
 Copy-Item -Path "$PSScriptRoot\autounattend.xml" -Destination "$ScratchDisk\tiny11\autounattend.xml" -Force | Out-Null
 Write-Output "Creating ISO image..."
-$ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$hostarchitecture\Oscdimg"
-$localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
-
-if ([System.IO.Directory]::Exists($ADKDepTools)) {
-    Write-Output "Will be using oscdimg.exe from system ADK."
-    $OSCDIMG = "$ADKDepTools\oscdimg.exe"
-} else {
-    Write-Output "ADK folder not found. Will be using bundled oscdimg.exe."
-    $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
-
-    if (-not (Test-Path -Path $localOSCDIMGPath)) {
-        Write-Output "Downloading oscdimg.exe..."
-        Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
-
-        if (Test-Path $localOSCDIMGPath) {
-            Write-Output "oscdimg.exe downloaded successfully."
-        } else {
-            Write-Error "Failed to download oscdimg.exe."
-            exit 1
-        }
-    } else {
-        Write-Output "oscdimg.exe already exists locally."
-    }
-
-    $OSCDIMG = $localOSCDIMGPath
-}
 
 & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$ScratchDisk\tiny11\boot\etfsboot.com#pEF,e,b$ScratchDisk\tiny11\efi\microsoft\boot\efisys.bin" "$ScratchDisk\tiny11" "$PSScriptRoot\tiny11.iso"
 
-# Finishing up
 Write-Output "Creation completed! Press any key to exit the script..."
 Read-Host "Press Enter to continue"
 Write-Output "Performing Cleanup..."
 Remove-Item -Path "$ScratchDisk\tiny11" -Recurse -Force | Out-Null
 Remove-Item -Path "$ScratchDisk\scratchdir" -Recurse -Force | Out-Null
-Write-Output "Ejecting Iso drive"
-Get-Volume -DriveLetter $DriveLetter[0] | Get-DiskImage | Dismount-DiskImage
-Write-Output "Iso drive ejected"
-Write-Output "Removing oscdimg.exe..."
-Remove-Item -Path "$PSScriptRoot\oscdimg.exe" -Force -ErrorAction SilentlyContinue
+
+if (-not $MountedByScript) {
+    try {
+        $letter = $DriveLetter.TrimEnd(':')
+        Get-Volume -DriveLetter $letter -ErrorAction Stop | Get-DiskImage | Dismount-DiskImage -ErrorAction SilentlyContinue | Out-Null
+        Write-Output "Source drive $DriveLetter ejected."
+    } catch {
+        Write-Output "Source drive was not mounted or could not be ejected."
+    }
+}
+
 Write-Output "Removing autounattend.xml..."
 Remove-Item -Path "$PSScriptRoot\autounattend.xml" -Force -ErrorAction SilentlyContinue
 
@@ -522,17 +676,6 @@ if (Test-Path -Path "$ScratchDisk\scratchdir") {
 } else {
     Write-Output "scratchdir folder does not exist. No action needed."
 }
-if (Test-Path -Path "$PSScriptRoot\oscdimg.exe") {
-    Write-Output "oscdimg.exe still exists. Attempting to remove it again..."
-    Remove-Item -Path "$PSScriptRoot\oscdimg.exe" -Force -ErrorAction SilentlyContinue
-    if (Test-Path -Path "$PSScriptRoot\oscdimg.exe") {
-        Write-Output "Failed to remove oscdimg.exe."
-    } else {
-        Write-Output "oscdimg.exe removed successfully."
-    }
-} else {
-    Write-Output "oscdimg.exe does not exist. No action needed."
-}
 if (Test-Path -Path "$PSScriptRoot\autounattend.xml") {
     Write-Output "autounattend.xml still exists. Attempting to remove it again..."
     Remove-Item -Path "$PSScriptRoot\autounattend.xml" -Force -ErrorAction SilentlyContinue
@@ -545,8 +688,6 @@ if (Test-Path -Path "$PSScriptRoot\autounattend.xml") {
     Write-Output "autounattend.xml does not exist. No action needed."
 }
 
-# Stop the transcript
 Stop-Transcript
 
 exit
-

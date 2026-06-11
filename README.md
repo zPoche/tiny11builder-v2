@@ -23,7 +23,7 @@ This script generates a significantly reduced Windows 11 image. However, **it's 
 
 ## Instructions:
 1. Download Windows 11 from the [Microsoft website](https://www.microsoft.com/software-download/windows11) or [Rufus](https://github.com/pbatard/rufus)
-2. Mount the downloaded ISO image using Windows Explorer.
+2. Mount the downloaded ISO image using Windows Explorer, **or** provide the `.iso` file path when prompted — the script can mount it automatically.
 3. Open **PowerShell 5.1** as Administrator. 
 4. Change the script execution policy :
 ```powershell
@@ -41,6 +41,12 @@ C:/path/to/your/tiny11/script.ps1 -ISO <inputletter> -SCRATCH <outputletter>
 > The finished image will be written to the same folder that the script is executed from.
 > 
 > You can see the help of the script by running the `get-help` command.
+
+**Custom app selection** — add `-Custom` to choose which apps to remove interactively:
+```powershell
+C:/path/to/your/tiny11/script.ps1 -ISO E -SCRATCH D -Custom
+```
+Without `-Custom`, all packages listed in `removePackage.txt` are removed (default).
 
 6. Select the SKU that you want the image to be based.
 7. Sit back and relax :)
@@ -102,9 +108,11 @@ You will be asked during image creation if you want to enable .net 3.5 support!
 
 ---
 
+## Customizing what gets removed
+Edit `removePackage.txt` to change the default removal list, or run with `-Custom` for an interactive selector before the build starts.
+
 ## Adding back a feature
-Since what to keep and what to delete [is not added yet](#features-to-be-implemented),  
-if you want to add or remove something after installing the tiny11maker iso (not possible with core),  
+If you want to add or remove something after installing the tiny11maker iso (not possible with core),  
 use the following in a admin powershell terminal.
 ```powershell
 DISM /Online /Get-Capabilities | findstr /i Hello
@@ -131,7 +139,7 @@ You should replace the Capability with the one returned of course.
 - ~~disabling telemetry~~ (Implemented in the 04-29-24 release!)
 - ~~more ad suppression~~ (Partially implemented in the 09-06-25 release!)
 - improved language and arch detection
-- more flexibility in what to keep and what to delete
+- ~~more flexibility in what to keep and what to delete~~ (Use `-Custom` or edit `removePackage.txt`)
 - maybe a GUI???
 
 And that's pretty much it for now!
