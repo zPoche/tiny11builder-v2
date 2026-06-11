@@ -401,6 +401,7 @@ Start-Transcript -Path "$PSScriptRoot\tiny11_$(get-date -f yyyyMMdd_HHmms).log"
 
 trap {
     Write-Error "Script failed: $($_.Exception.Message)"
+    Stop-Transcript -ErrorAction SilentlyContinue
     Read-Host "Press Enter to exit"
     exit 1
 }
@@ -438,8 +439,8 @@ if ($MountedByScript -and $ImagePath) {
     Dismount-DiskImage -ImagePath $ImagePath -ErrorAction SilentlyContinue | Out-Null
     Write-Output "Source ISO unmounted after copy."
 }
-Set-ItemProperty -Path "$ScratchDisk\tiny11\sources\install.esd" -Name IsReadOnly -Value $false -ErrorAction 'Continue' > $null 2>&1
-Remove-Item "$ScratchDisk\tiny11\sources\install.esd" -ErrorAction 'Continue' > $null 2>&1
+Set-ItemProperty -Path "$ScratchDisk\tiny11\sources\install.esd" -Name IsReadOnly -Value $false -ErrorAction 'Continue' | Out-Null
+Remove-Item "$ScratchDisk\tiny11\sources\install.esd" -ErrorAction 'Continue' | Out-Null
 Write-Output "Copy complete!"
 Start-Sleep -Seconds 2
 Clear-Host
@@ -459,7 +460,7 @@ try {
 } catch {
     Write-Error "$wimFilePath not found"
 }
-New-Item -ItemType Directory -Force -Path "$ScratchDisk\scratchdir" > $null
+New-Item -ItemType Directory -Force -Path "$ScratchDisk\scratchdir" | Out-Null
 Mount-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\install.wim -Index $index -Path $ScratchDisk\scratchdir
 
 $imageIntl = & dism /English /Get-Intl "/Image:$($ScratchDisk)\scratchdir"
