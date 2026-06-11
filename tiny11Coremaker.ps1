@@ -53,7 +53,15 @@ function Test-ScratchDiskSpace {
         [string]$ScratchPath,
         [uint64]$RequiredBytes = 20GB
     )
-    $driveName = (Get-Item $ScratchPath).PSDrive.Name
+    $itemPath = $ScratchPath
+    if (-not (Test-Path $itemPath)) {
+        $itemPath = Split-Path $ScratchPath -Parent
+    }
+    if (-not (Test-Path $itemPath)) {
+        Write-Warning "Could not verify free disk space for $ScratchPath"
+        return
+    }
+    $driveName = (Get-Item $itemPath).PSDrive.Name
     $freeBytes = (Get-PSDrive -Name $driveName).Free
     $requiredGb = [math]::Round($RequiredBytes / 1GB)
     $freeGb = [math]::Round($freeBytes / 1GB, 1)
@@ -89,6 +97,17 @@ function Unload-LoadedRegistries {
         $hive = $script:LoadedRegHives[$i]
         reg unload "HKLM\$hive" 2>&1 | Out-Null
         $script:LoadedRegHives.RemoveAt($i)
+    }
+}
+
+function Invoke-ScriptCleanupOnFailure {
+    Unload-LoadedRegistries
+    if ($mainOSDrive -and (Test-Path "$mainOSDrive\scratchdir")) {
+        try {
+            Dismount-WindowsImage -Path "$mainOSDrive\scratchdir" -Discard -ErrorAction Stop
+        } catch {
+            Write-Warning "Could not dismount scratch image during cleanup."
+        }
     }
 }
 
@@ -176,7 +195,7 @@ Start-Transcript -Path "$PSScriptRoot\tiny11.log"
 
 trap {
     Write-Error "Script failed: $($_.Exception.Message)"
-    Unload-LoadedRegistries
+    Invoke-ScriptCleanupOnFailure
     Stop-Transcript -ErrorAction SilentlyContinue
     Read-Host "Press Enter to exit"
     exit 1
@@ -217,38 +236,46 @@ do {
     }
 } while (-not $DriveLetter)
 
-if ((Test-Path "$DriveLetter\sources\boot.wim") -eq $false -or (Test-Path "$DriveLetter\sources\install.wim") -eq $false) {
-    if ((Test-Path "$DriveLetter\sources\install.esd") -eq $true) {
-        Write-Host "Found install.esd, converting to install.wim..."
-        $esdIndex = $null
-        $esdIndexes = (Get-WindowsImage -ImagePath "$DriveLetter\sources\install.esd").ImageIndex
-        while ($esdIndexes -notcontains $esdIndex) {
-            Get-WindowsImage -ImagePath "$DriveLetter\sources\install.esd"
-            $esdIndex = [int](Read-Host "Please enter the image index")
-        }
-        Write-Host ' '
-        Write-Host 'Converting install.esd to install.wim. This may take a while...'
-        Export-WindowsImage -SourceImagePath "$DriveLetter\sources\install.esd" -SourceIndex $esdIndex -DestinationImagePath "$mainOSDrive\tiny11\sources\install.wim" -CompressionType Maximum -CheckIntegrity
-    } else {
-        Write-Host "Can't find Windows OS Installation files in the specified Drive Letter.."
-        Write-Host "Please enter the correct DVD Drive Letter.."
-        exit
-    }
-}
-
+$selectedImageIndex = $null
 Write-Host "Copying Windows image..."
 Copy-Item -Path "$DriveLetter\*" -Destination "$mainOSDrive\tiny11" -Recurse -Force | Out-Null
+
+if (-not (Test-Path "$mainOSDrive\tiny11\sources\install.wim")) {
+    if (Test-Path "$mainOSDrive\tiny11\sources\install.esd") {
+        Write-Host "Found install.esd, converting to install.wim..."
+        $esdIndex = $null
+        $esdIndexes = (Get-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\install.esd").ImageIndex
+        while ($esdIndexes -notcontains $esdIndex) {
+            Get-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\install.esd"
+            $esdIndex = [int](Read-Host "Please enter the image index")
+        }
+        $selectedImageIndex = $esdIndex
+        Write-Host ' '
+        Write-Host 'Converting install.esd to install.wim. This may take a while...'
+        Export-WindowsImage -SourceImagePath "$mainOSDrive\tiny11\sources\install.esd" -SourceIndex $esdIndex -DestinationImagePath "$mainOSDrive\tiny11\sources\install.wim" -CompressionType Maximum -CheckIntegrity
+    } elseif (-not (Test-Path "$mainOSDrive\tiny11\sources\boot.wim")) {
+        Write-Host "Can't find Windows OS Installation files in the specified drive letter."
+        Write-Host "Please enter the correct DVD drive letter."
+        Stop-Transcript -ErrorAction SilentlyContinue
+        exit 1
+    }
+}
 Set-ItemProperty -Path "$mainOSDrive\tiny11\sources\install.esd" -Name IsReadOnly -Value $false -ErrorAction 'Continue' | Out-Null
 Remove-Item "$mainOSDrive\tiny11\sources\install.esd" -ErrorAction 'Continue' | Out-Null
 Write-Host "Copy complete!"
 Start-Sleep -Seconds 2
 Clear-Host
 Write-Host "Getting image information:"
-$index = $null
 $ImagesIndex = (Get-WindowsImage -ImagePath $mainOSDrive\tiny11\sources\install.wim).ImageIndex
-while ($ImagesIndex -notcontains $index) {
-    Get-WindowsImage -ImagePath $mainOSDrive\tiny11\sources\install.wim
-    $index = [int](Read-Host "Please enter the image index")
+$index = $selectedImageIndex
+if ($ImagesIndex -contains $index) {
+    Write-Host "Using image index $index from earlier selection."
+} else {
+    $index = $null
+    while ($ImagesIndex -notcontains $index) {
+        Get-WindowsImage -ImagePath $mainOSDrive\tiny11\sources\install.wim
+        $index = [int](Read-Host "Please enter the image index")
+    }
 }
 Write-Host "Mounting Windows image. This may take a while."
 $wimFilePath = "$($env:SystemDrive)\tiny11\sources\install.wim" 
@@ -311,8 +338,11 @@ $packagesToRemove = $packages | Where-Object {
     $match
 }
 foreach ($package in $packagesToRemove) {
-    write-host "Removing $package :"
+    Write-Host "Removing $package :"
     & 'dism' '/English' "/image:$($env:SystemDrive)\scratchdir" '/Remove-ProvisionedAppxPackage' "/PackageName:$package"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Failed to remove package $package (dism exit code $LASTEXITCODE)"
+    }
 }
 
 Write-Host "Removing of system apps complete! Now proceeding to removal of system packages..."
@@ -330,7 +360,7 @@ $packagePatterns = @(
     "Microsoft-Windows-LanguageFeatures-TextToSpeech-$languageCode-Package~31bf3856ad364e35",
     "Microsoft-Windows-MediaPlayer-Package~31bf3856ad364e35",
     "Microsoft-Windows-Wallpaper-Content-Extended-FoD-Package~31bf3856ad364e35",
-    "Windows-Defender-Client-Package~31bf3856ad364e35~",
+    "Windows-Defender-Client-Package~31bf3856ad364e35~$archSuffix",
     "Microsoft-Windows-WordPad-FoD-Package~",
     "Microsoft-Windows-TabletPCMath-Package~",
     "Microsoft-Windows-StepsRecorder-Package~"
@@ -350,7 +380,10 @@ foreach ($packagePattern in $packagePatterns) {
         $packageIdentity = ($package -split "\s+")[0]
 
         Write-Host "Removing $packageIdentity..."
-        & dism /image:$scratchDir /Remove-Package /PackageName:$packageIdentity 
+        & dism /image:$scratchDir /Remove-Package /PackageName:$packageIdentity
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Failed to remove package $packageIdentity (dism exit code $LASTEXITCODE)"
+        }
     }
 }
 
@@ -648,7 +681,7 @@ $servicePaths = @(
 )
 
 foreach ($path in $servicePaths) {
-    Set-ItemProperty -Path "HKLM:\zSYSTEM\ControlSet001\Services\$path" -Name "Start" -Value 4
+    Set-RegistryValue "HKLM\zSYSTEM\ControlSet001\Services\$path" 'Start' 'REG_DWORD' '4'
 }
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'SettingsPageVisibility' 'REG_SZ' 'hide:virus;windowsupdate'
 Write-Host "Tweaking complete!"

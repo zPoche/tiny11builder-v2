@@ -126,6 +126,20 @@ function Unload-LoadedRegistries {
     }
 }
 
+function Invoke-ScriptCleanupOnFailure {
+    Unload-LoadedRegistries
+    if ($script:MountedByScript -and $script:ImagePath) {
+        Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
+    }
+    if ($ScratchDisk -and (Test-Path "$ScratchDisk\scratchdir")) {
+        try {
+            Dismount-WindowsImage -Path "$ScratchDisk\scratchdir" -Discard -ErrorAction Stop
+        } catch {
+            Write-Warning "Could not dismount scratch image during cleanup."
+        }
+    }
+}
+
 function Resolve-AutounattendFile {
     param([string]$Architecture)
     if ($Architecture -eq 'arm64') {
@@ -429,7 +443,7 @@ Start-Transcript -Path "$PSScriptRoot\tiny11_$(get-date -f yyyyMMdd_HHmms).log"
 
 trap {
     Write-Error "Script failed: $($_.Exception.Message)"
-    Unload-LoadedRegistries
+    Invoke-ScriptCleanupOnFailure
     Stop-Transcript -ErrorAction SilentlyContinue
     Read-Host "Press Enter to exit"
     exit 1
@@ -446,29 +460,31 @@ $OSCDIMG = Initialize-Oscdimg -HostArchitecture $hostArchitecture
 
 New-Item -ItemType Directory -Force -Path "$ScratchDisk\tiny11\sources" | Out-Null
 $DriveLetter = Resolve-WindowsSource -IsoParameter $ISO
-
-if ((Test-Path "$DriveLetter\sources\boot.wim") -eq $false -or (Test-Path "$DriveLetter\sources\install.wim") -eq $false) {
-    if ((Test-Path "$DriveLetter\sources\install.esd") -eq $true) {
-        Write-Output "Found install.esd, converting to install.wim..."
-        $esdIndex = $null
-        $esdIndexes = (Get-WindowsImage -ImagePath "$DriveLetter\sources\install.esd").ImageIndex
-        while ($esdIndexes -notcontains $esdIndex) {
-            Get-WindowsImage -ImagePath "$DriveLetter\sources\install.esd"
-            $esdIndex = [int](Read-Host "Please enter the image index")
-        }
-        $index = $esdIndex
-        Write-Output ' '
-        Write-Output 'Converting install.esd to install.wim. This may take a while...'
-        Export-WindowsImage -SourceImagePath $DriveLetter\sources\install.esd -SourceIndex $index -DestinationImagePath $ScratchDisk\tiny11\sources\install.wim -Compressiontype Maximum -CheckIntegrity
-    } else {
-        Write-Output "Can't find Windows OS Installation files in the specified source."
-        Write-Output "Please provide a valid Windows 11 ISO or mounted drive."
-        exit 1
-    }
-}
+$selectedImageIndex = $null
 
 Write-Output "Copying Windows image..."
 Copy-Item -Path "$DriveLetter\*" -Destination "$ScratchDisk\tiny11" -Recurse -Force | Out-Null
+
+if (-not (Test-Path "$ScratchDisk\tiny11\sources\install.wim")) {
+    if (Test-Path "$ScratchDisk\tiny11\sources\install.esd") {
+        Write-Output "Found install.esd, converting to install.wim..."
+        $esdIndex = $null
+        $esdIndexes = (Get-WindowsImage -ImagePath "$ScratchDisk\tiny11\sources\install.esd").ImageIndex
+        while ($esdIndexes -notcontains $esdIndex) {
+            Get-WindowsImage -ImagePath "$ScratchDisk\tiny11\sources\install.esd"
+            $esdIndex = [int](Read-Host "Please enter the image index")
+        }
+        $selectedImageIndex = $esdIndex
+        Write-Output ' '
+        Write-Output 'Converting install.esd to install.wim. This may take a while...'
+        Export-WindowsImage -SourceImagePath "$ScratchDisk\tiny11\sources\install.esd" -SourceIndex $esdIndex -DestinationImagePath "$ScratchDisk\tiny11\sources\install.wim" -CompressionType Maximum -CheckIntegrity
+    } elseif (-not (Test-Path "$ScratchDisk\tiny11\sources\boot.wim")) {
+        Write-Output "Can't find Windows OS Installation files in the specified source."
+        Write-Output "Please provide a valid Windows 11 ISO or mounted drive."
+        Stop-Transcript -ErrorAction SilentlyContinue
+        exit 1
+    }
+}
 if ($MountedByScript -and $ImagePath) {
     Dismount-DiskImage -ImagePath $ImagePath -ErrorAction SilentlyContinue | Out-Null
     Write-Output "Source ISO unmounted after copy."
@@ -479,11 +495,16 @@ Write-Output "Copy complete!"
 Start-Sleep -Seconds 2
 Clear-Host
 Write-Output "Getting image information:"
-$index = $null
 $ImagesIndex = (Get-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\install.wim).ImageIndex
-while ($ImagesIndex -notcontains $index) {
-    Get-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\install.wim
-    $index = [int](Read-Host "Please enter the image index")
+$index = $selectedImageIndex
+if ($ImagesIndex -contains $index) {
+    Write-Output "Using image index $index from earlier selection."
+} else {
+    $index = $null
+    while ($ImagesIndex -notcontains $index) {
+        Get-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\install.wim
+        $index = [int](Read-Host "Please enter the image index")
+    }
 }
 Write-Output "Mounting Windows image. This may take a while."
 $wimFilePath = "$ScratchDisk\tiny11\sources\install.wim"
@@ -549,7 +570,7 @@ if ($Custom) {
     $selectedPrefixes = $packagePrefixes
 }
 
-if (-not $selectedPrefixes -or $selectedPrefixes.Count -eq 0) {
+if (-not $selectedPrefixes -or @($selectedPrefixes).Count -eq 0) {
     Write-Output "No package prefixes selected for removal. Skipping Appx package removal step."
     $packagesToRemove = @()
 } else {
@@ -581,6 +602,16 @@ if ($removeEdge) {
     Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\Edge" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
     Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\EdgeUpdate" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
     Remove-Item -Path "$ScratchDisk\scratchdir\Program Files (x86)\Microsoft\EdgeCore" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+    if ($architecture -eq 'amd64') {
+        $edgeWinSxS = Get-ChildItem -Path "$ScratchDisk\scratchdir\Windows\WinSxS" -Filter "amd64_microsoft-edge-webview_31bf3856ad364e35*" -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+    } elseif ($architecture -eq 'arm64') {
+        $edgeWinSxS = Get-ChildItem -Path "$ScratchDisk\scratchdir\Windows\WinSxS" -Filter "arm64_microsoft-edge-webview_31bf3856ad364e35*" -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+    }
+    if ($edgeWinSxS) {
+        & 'takeown' '/f' $edgeWinSxS '/r' | Out-Null
+        & 'icacls' $edgeWinSxS '/grant' "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
+        Remove-Item -Path $edgeWinSxS -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+    }
     & 'takeown' '/f' "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" '/r' | Out-Null
     & 'icacls' "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" '/grant' "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
     Remove-Item -Path "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null

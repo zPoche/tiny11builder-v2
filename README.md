@@ -9,7 +9,7 @@ This is made possible thanks to the much-improved scripting capabilities of Powe
 
 This is a script created to automate the build of a streamlined Windows 11 image, similar to tiny10.
 The script has also been updated to use DISM's recovery compression, resulting in a much smaller final ISO size, and no utilities from external sources. The only other executable included is **oscdimg.exe**, which is provided in the Windows ADK and it is used to create bootable ISO images. 
-Also included is an unattended answer file, which is used to bypass the Microsoft Account on OOBE and to deploy the image with the `/compact` flag.
+Also included are unattended answer files (`autounattend.xml` for amd64, `autounattend-arm64.xml` for arm64), which are used to bypass the Microsoft Account on OOBE and to deploy the image with the `/compact` flag.
 It's open-source, **so feel free to add or remove anything you want!** Feedback is also much appreciated.
 
 Also, for the very first time, **introducing tiny11 core builder**! A more powerful script, designed for a quick and dirty development testbed. Just the bare minimum, none of the fluff. 
