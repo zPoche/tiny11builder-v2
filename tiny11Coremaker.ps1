@@ -183,6 +183,17 @@ function Assert-WindowsSourceDrive {
     }
 }
 
+function Clear-FileReadOnly {
+    param([string]$FilePath)
+    if (-not (Test-Path -LiteralPath $FilePath)) {
+        return
+    }
+    & attrib -R $FilePath
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not clear read-only attribute on $FilePath (attrib exit code $LASTEXITCODE)."
+    }
+}
+
 function Show-WindowsImageMenu {
     param([array]$Images)
     Write-Host ''
@@ -408,7 +419,7 @@ if (-not (Test-Path "$mainOSDrive\tiny11\sources\install.wim")) {
     throw "install.wim is missing after copy/conversion. The source may be incomplete."
 }
 if (Test-Path "$mainOSDrive\tiny11\sources\install.esd") {
-    Set-ItemProperty -Path "$mainOSDrive\tiny11\sources\install.esd" -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue | Out-Null
+    Clear-FileReadOnly -FilePath "$mainOSDrive\tiny11\sources\install.esd"
     Remove-Item "$mainOSDrive\tiny11\sources\install.esd" -Force -ErrorAction SilentlyContinue | Out-Null
 }
 Write-Host "Copy complete!"
@@ -417,9 +428,9 @@ Write-Host "Getting image information:"
 $index = Resolve-InstallImageIndex -ImagePath $mainOSDrive\tiny11\sources\install.wim -PreferredIndex $selectedImageIndex
 Write-Host "Mounting Windows image. This may take a while."
 $wimFilePath = "$($env:SystemDrive)\tiny11\sources\install.wim" 
-& takeown "/F" $wimFilePath 
-& icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
-Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false -ErrorAction Stop
+& takeown "/F" $wimFilePath | Out-Null
+& icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)" | Out-Null
+Clear-FileReadOnly -FilePath $wimFilePath
 New-Item -ItemType Directory -Force -Path "$mainOSDrive\scratchdir" | Out-Null
 Mount-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\install.wim" -Index $index -Path "$mainOSDrive\scratchdir"
 
@@ -854,8 +865,8 @@ Clear-Host
 Write-Host "Mounting boot image:"
 $wimFilePath = "$($env:SystemDrive)\tiny11\sources\boot.wim" 
 & takeown "/F" $wimFilePath | Out-Null
-& icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
-Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false -ErrorAction Stop
+& icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)" | Out-Null
+Clear-FileReadOnly -FilePath $wimFilePath
 $bootWimIndex = Get-BootWimIndex -BootWimPath "$mainOSDrive\tiny11\sources\boot.wim"
 Write-Host "Using boot.wim index $bootWimIndex"
 Mount-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\boot.wim" -Index $bootWimIndex -Path "$mainOSDrive\scratchdir"
