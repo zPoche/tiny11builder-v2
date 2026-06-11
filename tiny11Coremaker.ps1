@@ -173,6 +173,32 @@ function Assert-WindowsSourceDrive {
     }
 }
 
+function Resolve-InstallImageIndex {
+    param(
+        [string]$ImagePath,
+        [Nullable[int]]$PreferredIndex
+    )
+    $images = @(Get-WindowsImage -ImagePath $ImagePath)
+    if ($images.Count -eq 0) {
+        throw "No images found in $ImagePath"
+    }
+    $indexes = @($images | ForEach-Object { $_.ImageIndex })
+    if ($null -ne $PreferredIndex -and ($indexes -contains $PreferredIndex)) {
+        Write-Host "Using image index $PreferredIndex from earlier selection."
+        return $PreferredIndex
+    }
+    if ($indexes.Count -eq 1) {
+        Write-Host "Only one image found; using index $($indexes[0])."
+        return $indexes[0]
+    }
+    $index = $null
+    while ($indexes -notcontains $index) {
+        Get-WindowsImage -ImagePath $ImagePath
+        $index = [int](Read-Host "Please enter the image index")
+    }
+    return $index
+}
+
 function Set-RegistryValue {
     param (
         [string]$path,
@@ -298,12 +324,7 @@ Copy-Item -Path "$DriveLetter\*" -Destination "$mainOSDrive\tiny11" -Recurse -Fo
 if (-not (Test-Path "$mainOSDrive\tiny11\sources\install.wim")) {
     if (Test-Path "$mainOSDrive\tiny11\sources\install.esd") {
         Write-Host "Found install.esd, converting to install.wim..."
-        $esdIndex = $null
-        $esdIndexes = (Get-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\install.esd").ImageIndex
-        while ($esdIndexes -notcontains $esdIndex) {
-            Get-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\install.esd"
-            $esdIndex = [int](Read-Host "Please enter the image index")
-        }
+        $esdIndex = Resolve-InstallImageIndex -ImagePath "$mainOSDrive\tiny11\sources\install.esd" -PreferredIndex $null
         Write-Host ' '
         Write-Host 'Converting install.esd to install.wim. This may take a while...'
         Export-WindowsImage -SourceImagePath "$mainOSDrive\tiny11\sources\install.esd" -SourceIndex $esdIndex -DestinationImagePath "$mainOSDrive\tiny11\sources\install.wim" -CompressionType Maximum -CheckIntegrity
@@ -321,17 +342,7 @@ Write-Host "Copy complete!"
 Start-Sleep -Seconds 2
 Clear-Host
 Write-Host "Getting image information:"
-$ImagesIndex = (Get-WindowsImage -ImagePath $mainOSDrive\tiny11\sources\install.wim).ImageIndex
-$index = $selectedImageIndex
-if ($ImagesIndex -contains $index) {
-    Write-Host "Using image index $index from earlier selection."
-} else {
-    $index = $null
-    while ($ImagesIndex -notcontains $index) {
-        Get-WindowsImage -ImagePath $mainOSDrive\tiny11\sources\install.wim
-        $index = [int](Read-Host "Please enter the image index")
-    }
-}
+$index = Resolve-InstallImageIndex -ImagePath $mainOSDrive\tiny11\sources\install.wim -PreferredIndex $selectedImageIndex
 Write-Host "Mounting Windows image. This may take a while."
 $wimFilePath = "$($env:SystemDrive)\tiny11\sources\install.wim" 
 & takeown "/F" $wimFilePath 
@@ -404,7 +415,7 @@ Start-Sleep -Seconds 1
 Clear-Host
 
 $scratchDir = "$($env:SystemDrive)\scratchdir"
-$archSuffix = if ($architecture) { $architecture } else { 'amd64' }
+$archSuffix = $architecture
 $packagePatterns = @(
     "Microsoft-Windows-InternetExplorer-Optional-Package~31bf3856ad364e35",
     "Microsoft-Windows-Kernel-LA57-FoD-Package~31bf3856ad364e35~$archSuffix",
@@ -481,7 +492,7 @@ if ($architecture -eq 'amd64') {
         Write-Host "Folder not found."
     }
 } else {
-    Write-Host "Unknown architecture: $architecture"
+    throw "Unsupported architecture for Edge removal: $architecture"
 }
 & 'takeown' '/f' "$mainOSDrive\scratchdir\Windows\System32\Microsoft-Edge-Webview" '/r' | Out-Null
 & 'icacls' "$mainOSDrive\scratchdir\Windows\System32\Microsoft-Edge-Webview" '/grant' "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
@@ -675,6 +686,7 @@ Set-RegistryValue 'HKLM\zNTUSER\Software\Microsoft\Personalization\Settings' 'Ac
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\DataCollection' 'AllowTelemetry' 'REG_DWORD' '0'
 Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\dmwappushservice' 'Start' 'REG_DWORD' '4'
 Write-Host "Prevents installation or DevHome and Outlook:"
+Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\DevHomeUpdate' 'workCompleted' 'REG_DWORD' '1'
 Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate'
@@ -753,6 +765,9 @@ Write-Host "Unmounting image..."
 Dismount-WindowsImage -Path "$mainOSDrive\scratchdir" -Save
 Write-Host "Exporting image..."
 Invoke-DismChecked -Label 'DISM export install.wim' /English /Export-Image "/SourceImageFile:$mainOSDrive\tiny11\sources\install.wim" "/SourceIndex:$index" "/DestinationImageFile:$mainOSDrive\tiny11\sources\install2.wim" /Compress:max
+if (-not (Test-Path "$mainOSDrive\tiny11\sources\install2.wim")) {
+    throw "DISM export failed: install2.wim was not created."
+}
 Remove-Item -Path "$mainOSDrive\tiny11\sources\install.wim" -Force | Out-Null
 Rename-Item -Path "$mainOSDrive\tiny11\sources\install2.wim" -NewName "install.wim" | Out-Null
 $index = 1
@@ -763,7 +778,7 @@ Write-Host "Mounting boot image:"
 $wimFilePath = "$($env:SystemDrive)\tiny11\sources\boot.wim" 
 & takeown "/F" $wimFilePath | Out-Null
 & icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
-Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false
+Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false -ErrorAction Stop
 $bootWimIndex = Get-BootWimIndex -BootWimPath "$mainOSDrive\tiny11\sources\boot.wim"
 Write-Host "Using boot.wim index $bootWimIndex"
 Mount-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\boot.wim" -Index $bootWimIndex -Path "$mainOSDrive\scratchdir"
@@ -806,6 +821,9 @@ Copy-AutounattendWithIndex -SourcePath $autounattendSource -DestinationPath "$ma
 Write-Host "Creating ISO image..."
 & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$mainOSDrive\tiny11\boot\etfsboot.com#pEF,e,b$mainOSDrive\tiny11\efi\microsoft\boot\efisys.bin" "$mainOSDrive\tiny11" "$PSScriptRoot\tiny11.iso"
 Assert-CommandExitCode -Label 'oscdimg ISO creation'
+if (-not (Test-Path "$PSScriptRoot\tiny11.iso")) {
+    throw "ISO creation failed: tiny11.iso was not created."
+}
 
 # Finishing up
 Write-Host "Creation completed! Press any key to exit the script..."

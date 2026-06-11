@@ -199,6 +199,32 @@ function Assert-WindowsSourceDrive {
     }
 }
 
+function Resolve-InstallImageIndex {
+    param(
+        [string]$ImagePath,
+        [Nullable[int]]$PreferredIndex
+    )
+    $images = @(Get-WindowsImage -ImagePath $ImagePath)
+    if ($images.Count -eq 0) {
+        throw "No images found in $ImagePath"
+    }
+    $indexes = @($images | ForEach-Object { $_.ImageIndex })
+    if ($null -ne $PreferredIndex -and ($indexes -contains $PreferredIndex)) {
+        Write-Output "Using image index $PreferredIndex from earlier selection."
+        return $PreferredIndex
+    }
+    if ($indexes.Count -eq 1) {
+        Write-Output "Only one image found; using index $($indexes[0])."
+        return $indexes[0]
+    }
+    $index = $null
+    while ($indexes -notcontains $index) {
+        Get-WindowsImage -ImagePath $ImagePath
+        $index = [int](Read-Host "Please enter the image index")
+    }
+    return $index
+}
+
 function Set-RegistryValue {
     param (
         [string]$path,
@@ -330,6 +356,23 @@ function Test-Prerequisites {
     }
 
     Write-Output "Prerequisites OK."
+}
+
+function Test-ScratchDiskNtfs {
+    param([string]$ScratchPath)
+    if (-not (Test-Path $ScratchPath)) {
+        Write-Warning "Could not verify NTFS filesystem for $ScratchPath"
+        return
+    }
+    $driveName = (Get-Item $ScratchPath).PSDrive.Name
+    $volume = Get-Volume -DriveLetter $driveName -ErrorAction SilentlyContinue
+    if (-not $volume) {
+        Write-Warning "Could not verify NTFS filesystem for ${driveName}:"
+        return
+    }
+    if ($volume.FileSystem -ne 'NTFS') {
+        throw "Scratch drive ${driveName}: must use NTFS (found $($volume.FileSystem)). ACL support is required for image processing."
+    }
 }
 
 function Test-ScratchDiskSpace {
@@ -521,6 +564,9 @@ Write-Output "Welcome to the tiny11 image creator! Release: 11-06-26"
 
 $hostArchitecture = $Env:PROCESSOR_ARCHITECTURE
 Test-Prerequisites
+if ($SCRATCH) {
+    Test-ScratchDiskNtfs -ScratchPath $ScratchDisk
+}
 Test-ScratchDiskSpace -ScratchPath $ScratchDisk
 $OSCDIMG = Initialize-Oscdimg -HostArchitecture $hostArchitecture
 
@@ -534,12 +580,7 @@ Copy-Item -Path "$DriveLetter\*" -Destination "$ScratchDisk\tiny11" -Recurse -Fo
 if (-not (Test-Path "$ScratchDisk\tiny11\sources\install.wim")) {
     if (Test-Path "$ScratchDisk\tiny11\sources\install.esd") {
         Write-Output "Found install.esd, converting to install.wim..."
-        $esdIndex = $null
-        $esdIndexes = (Get-WindowsImage -ImagePath "$ScratchDisk\tiny11\sources\install.esd").ImageIndex
-        while ($esdIndexes -notcontains $esdIndex) {
-            Get-WindowsImage -ImagePath "$ScratchDisk\tiny11\sources\install.esd"
-            $esdIndex = [int](Read-Host "Please enter the image index")
-        }
+        $esdIndex = Resolve-InstallImageIndex -ImagePath "$ScratchDisk\tiny11\sources\install.esd" -PreferredIndex $null
         Write-Output ' '
         Write-Output 'Converting install.esd to install.wim. This may take a while...'
         Export-WindowsImage -SourceImagePath "$ScratchDisk\tiny11\sources\install.esd" -SourceIndex $esdIndex -DestinationImagePath "$ScratchDisk\tiny11\sources\install.wim" -CompressionType Maximum -CheckIntegrity
@@ -553,6 +594,8 @@ if (-not (Test-Path "$ScratchDisk\tiny11\sources\install.wim")) {
 }
 if ($script:MountedByScript -and $script:ImagePath) {
     Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
+    $script:MountedByScript = $false
+    $script:ImagePath = $null
     Write-Output "Source ISO unmounted after copy."
 }
 Set-ItemProperty -Path "$ScratchDisk\tiny11\sources\install.esd" -Name IsReadOnly -Value $false -ErrorAction 'Continue' | Out-Null
@@ -561,17 +604,7 @@ Write-Output "Copy complete!"
 Start-Sleep -Seconds 2
 Clear-Host
 Write-Output "Getting image information:"
-$ImagesIndex = (Get-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\install.wim).ImageIndex
-$index = $selectedImageIndex
-if ($ImagesIndex -contains $index) {
-    Write-Output "Using image index $index from earlier selection."
-} else {
-    $index = $null
-    while ($ImagesIndex -notcontains $index) {
-        Get-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\install.wim
-        $index = [int](Read-Host "Please enter the image index")
-    }
-}
+$index = Resolve-InstallImageIndex -ImagePath $ScratchDisk\tiny11\sources\install.wim -PreferredIndex $selectedImageIndex
 Write-Output "Mounting Windows image. This may take a while."
 $wimFilePath = "$ScratchDisk\tiny11\sources\install.wim"
 & takeown "/F" $wimFilePath
@@ -830,6 +863,9 @@ Write-Output "Unmounting image..."
 Dismount-WindowsImage -Path $ScratchDisk\scratchdir -Save
 Write-Host "Exporting image..."
 Invoke-DismChecked -Label 'DISM export install.wim' /Export-Image /SourceImageFile:"$ScratchDisk\tiny11\sources\install.wim" /SourceIndex:$index /DestinationImageFile:"$ScratchDisk\tiny11\sources\install2.wim" /Compress:recovery
+if (-not (Test-Path "$ScratchDisk\tiny11\sources\install2.wim")) {
+    throw "DISM export failed: install2.wim was not created."
+}
 Remove-Item -Path "$ScratchDisk\tiny11\sources\install.wim" -Force | Out-Null
 Rename-Item -Path "$ScratchDisk\tiny11\sources\install2.wim" -NewName "install.wim" | Out-Null
 $index = 1
@@ -840,7 +876,7 @@ Write-Output "Mounting boot image:"
 $wimFilePath = "$ScratchDisk\tiny11\sources\boot.wim"
 & takeown "/F" $wimFilePath | Out-Null
 & icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
-Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false
+Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false -ErrorAction Stop
 $bootWimIndex = Get-BootWimIndex -BootWimPath "$ScratchDisk\tiny11\sources\boot.wim"
 Write-Output "Using boot.wim index $bootWimIndex"
 Mount-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\boot.wim -Index $bootWimIndex -Path $ScratchDisk\scratchdir
@@ -881,6 +917,9 @@ Write-Output "Creating ISO image..."
 
 & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$ScratchDisk\tiny11\boot\etfsboot.com#pEF,e,b$ScratchDisk\tiny11\efi\microsoft\boot\efisys.bin" "$ScratchDisk\tiny11" "$PSScriptRoot\tiny11.iso"
 Assert-CommandExitCode -Label 'oscdimg ISO creation'
+if (-not (Test-Path "$PSScriptRoot\tiny11.iso")) {
+    throw "ISO creation failed: tiny11.iso was not created."
+}
 
 Write-Output "Creation completed! Press any key to exit the script..."
 Read-Host "Press Enter to continue"
