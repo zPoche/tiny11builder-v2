@@ -129,7 +129,7 @@ You should replace the Capability with the one returned of course.
 ---
 
 ## Known issues:
-- `tiny11Coremaker.ps1` does not support `-Custom` debloat or ISO auto-mount (use `tiny11maker.ps1` for those features).
+- `tiny11Coremaker.ps1` uses the same `removePackage.txt` as maker but does not support `-Custom` debloat or ISO auto-mount.
 - Although Edge is removed, there are some remnants in the Settings, but the app in itself is deleted. 
 - You might have to update Winget before being able to install any apps, using Microsoft Store.
 - Outlook and Dev Home might reappear after some time. This is an ongoing battle, though the latest script update tries to prevent this more aggressively.

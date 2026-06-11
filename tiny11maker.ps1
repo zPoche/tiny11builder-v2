@@ -154,6 +154,30 @@ function Resolve-AutounattendFile {
     return $defaultPath
 }
 
+function Get-BootWimIndex {
+    param([string]$BootWimPath)
+    $images = @(Get-WindowsImage -ImagePath $BootWimPath)
+    foreach ($img in $images) {
+        if ($img.ImageName -match 'Windows Setup') {
+            return $img.ImageIndex
+        }
+    }
+    if ($images.ImageIndex -contains 2) { return 2 }
+    if ($images.Count -gt 0) { return $images[0].ImageIndex }
+    throw "No images found in $BootWimPath"
+}
+
+function Copy-AutounattendWithIndex {
+    param(
+        [string]$SourcePath,
+        [string]$DestinationPath,
+        [int]$ImageIndex = 1
+    )
+    $xml = Get-Content -Path $SourcePath -Raw
+    $xml = $xml -replace '(<Key>/IMAGE/INDEX</Key>\s*<Value>)\d+(</Value>)', "`${1}${ImageIndex}`${2}"
+    Set-Content -Path $DestinationPath -Value $xml -Encoding UTF8
+}
+
 function Set-RegistryValue {
     param (
         [string]$path,
@@ -271,20 +295,17 @@ function Test-Prerequisites {
     Write-Output "Checking prerequisites..."
 
     if (-not (Get-Command 'dism.exe' -ErrorAction SilentlyContinue)) {
-        Write-Error "DISM was not found. Install the Windows Assessment and Deployment Kit (ADK) or run on a Windows edition that includes deployment tools."
-        exit 1
+        throw "DISM was not found. Install the Windows Assessment and Deployment Kit (ADK) or run on a Windows edition that includes deployment tools."
     }
 
     foreach ($cmd in @('Mount-WindowsImage', 'Dismount-WindowsImage', 'Get-WindowsImage', 'Export-WindowsImage')) {
         if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
-            Write-Error "Required cmdlet '$cmd' was not found. Install the DISM PowerShell module (usually included with ADK)."
-            exit 1
+            throw "Required cmdlet '$cmd' was not found. Install the DISM PowerShell module (usually included with ADK)."
         }
     }
 
     if (-not (Test-Path "$PSScriptRoot\removePackage.txt")) {
-        Write-Error "removePackage.txt was not found in $PSScriptRoot"
-        exit 1
+        throw "removePackage.txt was not found in $PSScriptRoot"
     }
 
     Write-Output "Prerequisites OK."
@@ -337,8 +358,7 @@ function Initialize-Oscdimg {
         Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
 
         if (-not (Test-Path $localOSCDIMGPath)) {
-            Write-Error "Failed to download oscdimg.exe."
-            exit 1
+            throw "Failed to download oscdimg.exe."
         }
         Write-Output "oscdimg.exe downloaded successfully."
     } else {
@@ -358,6 +378,9 @@ function Resolve-WindowsSource {
     if ($IsoParameter) {
         if ($IsoParameter -match '^[c-zC-Z]$') {
             $driveLetter = $IsoParameter + ":"
+            if (-not (Test-Path "$driveLetter\sources\boot.wim")) {
+                throw "Drive $driveLetter does not contain sources\boot.wim. Mount a valid Windows 11 ISO."
+            }
             Write-Output "Using mounted drive $driveLetter"
             return $driveLetter
         }
@@ -365,16 +388,14 @@ function Resolve-WindowsSource {
             $script:ImagePath = $IsoParameter
             $vol = Mount-DiskImage -ImagePath $script:ImagePath -Access ReadOnly -PassThru | Get-Volume
             if (-not $vol.DriveLetter) {
-                Write-Error "ISO mounted but no drive letter was assigned."
-                exit 1
+                throw "ISO mounted but no drive letter was assigned."
             }
             $driveLetter = $vol.DriveLetter + ":"
             $script:MountedByScript = $true
             Write-Output "Mounted $($script:ImagePath) at $driveLetter"
             return $driveLetter
         }
-        Write-Error "Invalid -ISO value. Provide a drive letter (e.g. E) or a path to a .iso file."
-        exit 1
+        throw "Invalid -ISO value. Provide a drive letter (e.g. E) or a path to a .iso file."
     }
 
     do {
@@ -382,6 +403,11 @@ function Resolve-WindowsSource {
         $userInput = $userInput.Trim() -replace '"', ''
         if ($userInput -match '^[c-zC-Z]$') {
             $driveLetter = $userInput + ":"
+            if (-not (Test-Path "$driveLetter\sources\boot.wim")) {
+                Write-Output "Drive $driveLetter does not contain sources\boot.wim. Try another drive or ISO path."
+                $driveLetter = $null
+                continue
+            }
             Write-Output "Using mounted drive $driveLetter"
         } elseif ((Test-Path $userInput -PathType Leaf) -and ($userInput -match '\.iso$')) {
             $script:ImagePath = $userInput
@@ -479,10 +505,7 @@ if (-not (Test-Path "$ScratchDisk\tiny11\sources\install.wim")) {
         Write-Output 'Converting install.esd to install.wim. This may take a while...'
         Export-WindowsImage -SourceImagePath "$ScratchDisk\tiny11\sources\install.esd" -SourceIndex $esdIndex -DestinationImagePath "$ScratchDisk\tiny11\sources\install.wim" -CompressionType Maximum -CheckIntegrity
     } elseif (-not (Test-Path "$ScratchDisk\tiny11\sources\boot.wim")) {
-        Write-Output "Can't find Windows OS Installation files in the specified source."
-        Write-Output "Please provide a valid Windows 11 ISO or mounted drive."
-        Stop-Transcript -ErrorAction SilentlyContinue
-        exit 1
+        throw "Can't find Windows OS Installation files in the specified source. Provide a valid Windows 11 ISO or mounted drive."
     }
 }
 if ($MountedByScript -and $ImagePath) {
@@ -561,13 +584,13 @@ $packagePrefixes = Get-Content -Path "$PSScriptRoot\removePackage.txt" |
 
 if ($Custom) {
     try {
-        $selectedPrefixes = Show-PackageSelector -Items $packagePrefixes
+        $selectedPrefixes = @(Show-PackageSelector -Items $packagePrefixes)
     } catch {
         Write-Warning "Interactive selector failed or was interrupted. Defaulting to all prefixes."
-        $selectedPrefixes = $packagePrefixes
+        $selectedPrefixes = @($packagePrefixes)
     }
 } else {
-    $selectedPrefixes = $packagePrefixes
+    $selectedPrefixes = @($packagePrefixes)
 }
 
 if (-not $selectedPrefixes -or @($selectedPrefixes).Count -eq 0) {
@@ -675,7 +698,7 @@ Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'Disa
 Write-Output "Enabling Local Accounts on OOBE:"
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\OOBE' 'BypassNRO' 'REG_DWORD' '1'
 $autounattendSource = Resolve-AutounattendFile -Architecture $architecture
-Copy-Item -Path $autounattendSource -Destination "$ScratchDisk\scratchdir\Windows\System32\Sysprep\autounattend.xml" -Force | Out-Null
+Copy-AutounattendWithIndex -SourcePath $autounattendSource -DestinationPath "$ScratchDisk\scratchdir\Windows\System32\Sysprep\autounattend.xml" -ImageIndex 1
 
 Write-Output "Disabling Reserved Storage:"
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager' 'ShippedWithReserves' 'REG_DWORD' '0'
@@ -770,6 +793,7 @@ Write-Host "Exporting image..."
 Invoke-DismChecked -Label 'DISM export install.wim' /Export-Image /SourceImageFile:"$ScratchDisk\tiny11\sources\install.wim" /SourceIndex:$index /DestinationImageFile:"$ScratchDisk\tiny11\sources\install2.wim" /Compress:recovery
 Remove-Item -Path "$ScratchDisk\tiny11\sources\install.wim" -Force | Out-Null
 Rename-Item -Path "$ScratchDisk\tiny11\sources\install2.wim" -NewName "install.wim" | Out-Null
+$index = 1
 Write-Output "Windows image completed. Continuing with boot.wim."
 Start-Sleep -Seconds 2
 Clear-Host
@@ -778,7 +802,9 @@ $wimFilePath = "$ScratchDisk\tiny11\sources\boot.wim"
 & takeown "/F" $wimFilePath | Out-Null
 & icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
 Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false
-Mount-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\boot.wim -Index 2 -Path $ScratchDisk\scratchdir
+$bootWimIndex = Get-BootWimIndex -BootWimPath "$ScratchDisk\tiny11\sources\boot.wim"
+Write-Output "Using boot.wim index $bootWimIndex"
+Mount-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\boot.wim -Index $bootWimIndex -Path $ScratchDisk\scratchdir
 Write-Output "Loading registry..."
 Invoke-RegLoad -HiveName 'zCOMPONENTS' -FilePath "$ScratchDisk\scratchdir\Windows\System32\config\COMPONENTS"
 Invoke-RegLoad -HiveName 'zDEFAULT' -FilePath "$ScratchDisk\scratchdir\Windows\System32\config\default"
@@ -811,7 +837,7 @@ Dismount-WindowsImage -Path $ScratchDisk\scratchdir -Save
 Clear-Host
 Write-Output "The tiny11 image is now completed. Proceeding with the making of the ISO..."
 Write-Output "Copying unattended file for bypassing MS account on OOBE..."
-Copy-Item -Path $autounattendSource -Destination "$ScratchDisk\tiny11\autounattend.xml" -Force | Out-Null
+Copy-AutounattendWithIndex -SourcePath $autounattendSource -DestinationPath "$ScratchDisk\tiny11\autounattend.xml" -ImageIndex 1
 Write-Output "Creating ISO image..."
 
 & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$ScratchDisk\tiny11\boot\etfsboot.com#pEF,e,b$ScratchDisk\tiny11\efi\microsoft\boot\efisys.bin" "$ScratchDisk\tiny11" "$PSScriptRoot\tiny11.iso"

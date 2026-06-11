@@ -45,6 +45,9 @@ function Test-CoremakerPrerequisites {
             throw "Required cmdlet '$cmd' was not found."
         }
     }
+    if (-not (Test-Path "$PSScriptRoot\removePackage.txt")) {
+        throw "removePackage.txt was not found in $PSScriptRoot"
+    }
     Write-Host "Prerequisites OK."
 }
 
@@ -123,6 +126,30 @@ function Resolve-AutounattendFile {
         throw "autounattend.xml not found in $PSScriptRoot"
     }
     return $defaultPath
+}
+
+function Get-BootWimIndex {
+    param([string]$BootWimPath)
+    $images = @(Get-WindowsImage -ImagePath $BootWimPath)
+    foreach ($img in $images) {
+        if ($img.ImageName -match 'Windows Setup') {
+            return $img.ImageIndex
+        }
+    }
+    if ($images.ImageIndex -contains 2) { return 2 }
+    if ($images.Count -gt 0) { return $images[0].ImageIndex }
+    throw "No images found in $BootWimPath"
+}
+
+function Copy-AutounattendWithIndex {
+    param(
+        [string]$SourcePath,
+        [string]$DestinationPath,
+        [int]$ImageIndex = 1
+    )
+    $xml = Get-Content -Path $SourcePath -Raw
+    $xml = $xml -replace '(<Key>/IMAGE/INDEX</Key>\s*<Value>)\d+(</Value>)', "`${1}${ImageIndex}`${2}"
+    Set-Content -Path $DestinationPath -Value $xml -Encoding UTF8
 }
 
 function Set-RegistryValue {
@@ -229,7 +256,13 @@ New-Item -ItemType Directory -Force -Path "$mainOSDrive\tiny11\sources" | Out-Nu
 do {
     $driveInput = (Read-Host "Please enter the drive letter for the Windows 11 image").Trim() -replace ':$', ''
     if ($driveInput -match '^[c-zC-Z]$') {
-        $DriveLetter = $driveInput + ":"
+        $candidate = $driveInput + ":"
+        if ((Test-Path "$candidate\sources\boot.wim") -or (Test-Path "$candidate\sources\install.wim") -or (Test-Path "$candidate\sources\install.esd")) {
+            $DriveLetter = $candidate
+        } else {
+            Write-Host "Drive $candidate does not contain a Windows 11 image (expected sources\boot.wim and install.wim or install.esd)."
+            $DriveLetter = $null
+        }
     } else {
         Write-Host "Invalid drive letter. Enter a single letter (e.g. E)."
         $DriveLetter = $null
@@ -327,7 +360,10 @@ $packages = & 'dism' '/English' "/image:$($env:SystemDrive)\scratchdir" '/Get-Pr
             $matches[1]
         }
     }
-$packagePrefixes = 'Clipchamp.Clipchamp_', 'Microsoft.BingNews_', 'Microsoft.BingWeather_', 'Microsoft.GamingApp_', 'Microsoft.GetHelp_', 'Microsoft.Getstarted_', 'Microsoft.MicrosoftOfficeHub_', 'Microsoft.MicrosoftSolitaireCollection_', 'Microsoft.People_', 'Microsoft.PowerAutomateDesktop_', 'Microsoft.Todos_', 'Microsoft.WindowsAlarms_', 'microsoft.windowscommunicationsapps_', 'Microsoft.WindowsFeedbackHub_', 'Microsoft.WindowsMaps_', 'Microsoft.WindowsSoundRecorder_', 'Microsoft.Xbox.TCUI_', 'Microsoft.XboxGamingOverlay_', 'Microsoft.XboxGameOverlay_', 'Microsoft.XboxSpeechToTextOverlay_', 'Microsoft.YourPhone_', 'Microsoft.ZuneMusic_', 'Microsoft.ZuneVideo_', 'MicrosoftCorporationII.MicrosoftFamily_', 'MicrosoftCorporationII.QuickAssist_', 'MicrosoftTeams_', 'Microsoft.549981C3F5F10_', 'Microsoft.Windows.Copilot', 'MSTeams_', 'Microsoft.OutlookForWindows_', 'Microsoft.Windows.Teams_', 'Microsoft.Copilot_'
+$packagePrefixes = @(Get-Content -Path "$PSScriptRoot\removePackage.txt" |
+    Where-Object { $_.Trim() -ne '' -and -not $_.Trim().StartsWith('#') } |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -ne 'OneDrive' })
 
 $packagesToRemove = $packages | Where-Object {
     $pkg = $_
@@ -458,7 +494,7 @@ Write-Host "Preparing..."
 $folderPath = Join-Path -Path $mainOSDrive -ChildPath "scratchdir\Windows\WinSxS_edit"
 $sourceDirectory = "$mainOSDrive\scratchdir\Windows\WinSxS"
 $destinationDirectory = "$mainOSDrive\scratchdir\Windows\WinSxS_edit"
-New-Item -Path $folderPath -ItemType Directory
+New-Item -Path $folderPath -ItemType Directory -Force | Out-Null
 if ($architecture -eq "amd64") {
    $dirsToCopy = @(
         "x86_microsoft.windows.common-controls_6595b64144ccf1df_*",
@@ -594,7 +630,7 @@ Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' 'Disa
 Write-Host "Enabling Local Accounts on OOBE:"
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\OOBE' 'BypassNRO' 'REG_DWORD' '1'
 $autounattendSource = Resolve-AutounattendFile -Architecture $architecture
-Copy-Item -Path $autounattendSource -Destination "$mainOSDrive\scratchdir\Windows\System32\Sysprep\autounattend.xml" -Force | Out-Null
+Copy-AutounattendWithIndex -SourcePath $autounattendSource -DestinationPath "$mainOSDrive\scratchdir\Windows\System32\Sysprep\autounattend.xml" -ImageIndex 1
 Write-Host "Disabling Reserved Storage:"
 Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager' 'ShippedWithReserves' 'REG_DWORD' '0'
 Write-Host "Disabling BitLocker Device Encryption"
@@ -701,6 +737,7 @@ Write-Host "Exporting image..."
 Invoke-DismChecked -Label 'DISM export install.wim' /English /Export-Image "/SourceImageFile:$mainOSDrive\tiny11\sources\install.wim" "/SourceIndex:$index" "/DestinationImageFile:$mainOSDrive\tiny11\sources\install2.wim" /Compress:max
 Remove-Item -Path "$mainOSDrive\tiny11\sources\install.wim" -Force | Out-Null
 Rename-Item -Path "$mainOSDrive\tiny11\sources\install2.wim" -NewName "install.wim" | Out-Null
+$index = 1
 Write-Host "Windows image completed. Continuing with boot.wim."
 Start-Sleep -Seconds 2
 Clear-Host
@@ -709,7 +746,9 @@ $wimFilePath = "$($env:SystemDrive)\tiny11\sources\boot.wim"
 & takeown "/F" $wimFilePath | Out-Null
 & icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
 Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false
-Mount-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\boot.wim" -Index 2 -Path "$mainOSDrive\scratchdir"
+$bootWimIndex = Get-BootWimIndex -BootWimPath "$mainOSDrive\tiny11\sources\boot.wim"
+Write-Host "Using boot.wim index $bootWimIndex"
+Mount-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\boot.wim" -Index $bootWimIndex -Path "$mainOSDrive\scratchdir"
 Write-Host "Loading registry..."
 Invoke-RegLoad -HiveName 'zCOMPONENTS' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\COMPONENTS"
 Invoke-RegLoad -HiveName 'zDEFAULT' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\default"
@@ -739,10 +778,10 @@ Write-Host "Unmounting image..."
 Dismount-WindowsImage -Path "$mainOSDrive\scratchdir" -Save
 Clear-Host
 Write-Host "Exporting ESD. This may take a while..."
-Export-WindowsImage -SourceImagePath "$mainOSDrive\tiny11\sources\install.wim" -SourceIndex $index -DestinationImagePath "$mainOSDrive\tiny11\sources\install.esd" -CompressionType Recovery
+Export-WindowsImage -SourceImagePath "$mainOSDrive\tiny11\sources\install.wim" -SourceIndex 1 -DestinationImagePath "$mainOSDrive\tiny11\sources\install.esd" -CompressionType Recovery
 Remove-Item "$mainOSDrive\tiny11\sources\install.wim" -ErrorAction SilentlyContinue | Out-Null
 Write-Host "The tiny11 image is now completed. Proceeding with the making of the ISO..."
-Copy-Item -Path $autounattendSource -Destination "$mainOSDrive\tiny11\autounattend.xml" -Force | Out-Null
+Copy-AutounattendWithIndex -SourcePath $autounattendSource -DestinationPath "$mainOSDrive\tiny11\autounattend.xml" -ImageIndex 1
 Write-Host "Creating ISO image..."
 & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$mainOSDrive\tiny11\boot\etfsboot.com#pEF,e,b$mainOSDrive\tiny11\efi\microsoft\boot\efisys.bin" "$mainOSDrive\tiny11" "$PSScriptRoot\tiny11.iso"
 Assert-CommandExitCode -Label 'oscdimg ISO creation'
