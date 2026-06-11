@@ -502,6 +502,53 @@ function Initialize-Oscdimg {
     return $oscdimgPath
 }
 
+function Mount-IsoAndGetDriveLetter {
+    param([string]$ImagePath)
+
+    if (-not (Test-Path -LiteralPath $ImagePath -PathType Leaf)) {
+        throw "ISO file not found: $ImagePath"
+    }
+
+    $imagePath = (Resolve-Path -LiteralPath $ImagePath).Path
+    $diskImage = Get-DiskImage -ImagePath $imagePath -ErrorAction SilentlyContinue
+    if (-not $diskImage -or -not $diskImage.Attached) {
+        Mount-DiskImage -ImagePath $imagePath -Access ReadOnly -PassThru | Out-Null
+    } else {
+        Write-Output "ISO is already mounted: $imagePath"
+    }
+
+    $driveLetter = $null
+    for ($i = 0; $i -lt 60; $i++) {
+        $vol = Get-DiskImage -ImagePath $imagePath -ErrorAction SilentlyContinue | Get-Volume -ErrorAction SilentlyContinue
+        if ($vol) {
+            if ($vol -is [System.Array]) {
+                $vol = @($vol | Where-Object { $_.DriveLetter } | Select-Object -First 1)
+            }
+            if ($vol -and $vol.DriveLetter) {
+                $driveLetter = [string]$vol.DriveLetter
+                break
+            }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    if (-not $driveLetter) {
+        Dismount-DiskImage -ImagePath $imagePath -ErrorAction SilentlyContinue | Out-Null
+        throw "ISO mounted but no drive letter was assigned. Mount the ISO manually in Explorer and pass that drive letter with -ISO."
+    }
+
+    $driveRoot = ($driveLetter.TrimEnd(':') + ':')
+    if ($driveRoot -notmatch '^[A-Za-z]:$') {
+        Dismount-DiskImage -ImagePath $imagePath -ErrorAction SilentlyContinue | Out-Null
+        throw "Could not resolve a valid drive letter for mounted ISO (got '$driveLetter')."
+    }
+
+    return @{
+        ImagePath = $imagePath
+        DriveRoot = $driveRoot
+    }
+}
+
 function Resolve-WindowsSource {
     param([string]$IsoParameter)
 
@@ -516,19 +563,16 @@ function Resolve-WindowsSource {
             Write-Output "Using mounted drive $driveLetter"
             return $driveLetter
         }
-        if ((Test-Path $IsoParameter -PathType Leaf) -and ($IsoParameter -match '\.iso$')) {
-            $script:ImagePath = $IsoParameter
-            $vol = Mount-DiskImage -ImagePath $script:ImagePath -Access ReadOnly -PassThru | Get-Volume
-            if (-not $vol.DriveLetter) {
-                Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
-                $script:ImagePath = $null
-                throw "ISO mounted but no drive letter was assigned."
-            }
-            $driveLetter = $vol.DriveLetter + ":"
+        if ((Test-Path -LiteralPath $IsoParameter -PathType Leaf) -and ($IsoParameter -match '\.iso$')) {
             try {
+                $mount = Mount-IsoAndGetDriveLetter -ImagePath $IsoParameter
+                $script:ImagePath = $mount.ImagePath
+                $driveLetter = $mount.DriveRoot
                 Assert-WindowsSourceDrive -DriveRoot $driveLetter
             } catch {
-                Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
+                if ($script:ImagePath) {
+                    Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
+                }
                 $script:ImagePath = $null
                 throw
             }
@@ -552,22 +596,17 @@ function Resolve-WindowsSource {
                 continue
             }
             Write-Output "Using mounted drive $driveLetter"
-        } elseif ((Test-Path $userInput -PathType Leaf) -and ($userInput -match '\.iso$')) {
-            $script:ImagePath = $userInput
-            $vol = Mount-DiskImage -ImagePath $script:ImagePath -Access ReadOnly -PassThru | Get-Volume
-            if (-not $vol.DriveLetter) {
-                Write-Output "ISO mounted but no drive letter was assigned. Try mounting manually or use a different ISO."
-                Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
-                $script:ImagePath = $null
-                $driveLetter = $null
-                continue
-            }
-            $driveLetter = $vol.DriveLetter + ":"
+        } elseif ((Test-Path -LiteralPath $userInput -PathType Leaf) -and ($userInput -match '\.iso$')) {
             try {
+                $mount = Mount-IsoAndGetDriveLetter -ImagePath $userInput
+                $script:ImagePath = $mount.ImagePath
+                $driveLetter = $mount.DriveRoot
                 Assert-WindowsSourceDrive -DriveRoot $driveLetter
             } catch {
                 Write-Output $_.Exception.Message
-                Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
+                if ($script:ImagePath) {
+                    Dismount-DiskImage -ImagePath $script:ImagePath -ErrorAction SilentlyContinue | Out-Null
+                }
                 $script:ImagePath = $null
                 $script:MountedByScript = $false
                 $driveLetter = $null
