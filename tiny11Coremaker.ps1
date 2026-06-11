@@ -86,7 +86,8 @@ if ($languageLine) {
     $languageCode = $Matches[1]
     Write-Host "Default system UI language code: $languageCode"
 } else {
-    Write-Host "Default system UI language code not found."
+    $languageCode = 'en-US'
+    Write-Host "Default system UI language code not found. Falling back to $languageCode for language package removal."
 }
 
 $imageInfo = & 'dism' '/English' '/Get-WimInfo' "/wimFile:$($env:SystemDrive)\tiny11\sources\install.wim" "/index:$index"
@@ -283,35 +284,35 @@ if ($architecture -eq "amd64") {
         "arm64_microsoft-windows-servicingstack-onecore_31bf3856ad364e35_*",
         "Catalogs",
         "FileMaps",
-        "Fusion"
-        "InstallTemp"
-        "Manifests"
-        "SettingsManifests"
-        "Temp"
-        "x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_*"
-        "x86_microsoft.vc90.crt_1fc8b3b9a1e18e3b_*"
-        "x86_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*"
-        "x86_microsoft.windows.common-controls_6595b64144ccf1df_*"
-        "x86_microsoft.windows.gdiplus_6595b64144ccf1df_*"
-        "x86_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*"
-        "x86_microsoft.windows.isolationautomation_6595b64144ccf1df_*"
-        "arm_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*"
-        "arm_microsoft.windows.common-controls_6595b64144ccf1df_*"
-        "arm_microsoft.windows.gdiplus_6595b64144ccf1df_*"
-        "arm_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*"
-        "arm_microsoft.windows.isolationautomation_6595b64144ccf1df_*"
-        "arm64_microsoft.vc80.crt_1fc8b3b9a1e18e3b_*"
-        "arm64_microsoft.vc90.crt_1fc8b3b9a1e18e3b_*"
-        "arm64_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*"
-        "arm64_microsoft.windows.common-controls_6595b64144ccf1df_*"
-        "arm64_microsoft.windows.gdiplus_6595b64144ccf1df_*"
-        "arm64_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*"
-        "arm64_microsoft.windows.isolationautomation_6595b64144ccf1df_*"
-        "arm64_microsoft-windows-servicing-adm_31bf3856ad364e35_*"
-        "arm64_microsoft-windows-servicingcommon_31bf3856ad364e35_*"
-        "arm64_microsoft-windows-servicing-onecore-uapi_31bf3856ad364e35_*"
-        "arm64_microsoft-windows-servicingstack_31bf3856ad364e35_*"
-        "arm64_microsoft-windows-servicingstack-inetsrv_31bf3856ad364e35_*"
+        "Fusion",
+        "InstallTemp",
+        "Manifests",
+        "SettingsManifests",
+        "Temp",
+        "x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_*",
+        "x86_microsoft.vc90.crt_1fc8b3b9a1e18e3b_*",
+        "x86_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*",
+        "x86_microsoft.windows.common-controls_6595b64144ccf1df_*",
+        "x86_microsoft.windows.gdiplus_6595b64144ccf1df_*",
+        "x86_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*",
+        "x86_microsoft.windows.isolationautomation_6595b64144ccf1df_*",
+        "arm_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*",
+        "arm_microsoft.windows.common-controls_6595b64144ccf1df_*",
+        "arm_microsoft.windows.gdiplus_6595b64144ccf1df_*",
+        "arm_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*",
+        "arm_microsoft.windows.isolationautomation_6595b64144ccf1df_*",
+        "arm64_microsoft.vc80.crt_1fc8b3b9a1e18e3b_*",
+        "arm64_microsoft.vc90.crt_1fc8b3b9a1e18e3b_*",
+        "arm64_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*",
+        "arm64_microsoft.windows.common-controls_6595b64144ccf1df_*",
+        "arm64_microsoft.windows.gdiplus_6595b64144ccf1df_*",
+        "arm64_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*",
+        "arm64_microsoft.windows.isolationautomation_6595b64144ccf1df_*",
+        "arm64_microsoft-windows-servicing-adm_31bf3856ad364e35_*",
+        "arm64_microsoft-windows-servicingcommon_31bf3856ad364e35_*",
+        "arm64_microsoft-windows-servicing-onecore-uapi_31bf3856ad364e35_*",
+        "arm64_microsoft-windows-servicingstack_31bf3856ad364e35_*",
+        "arm64_microsoft-windows-servicingstack-inetsrv_31bf3856ad364e35_*",
         "arm64_microsoft-windows-servicingstack-msg_31bf3856ad364e35_*"
     )
 }
@@ -529,7 +530,8 @@ Write-Host "Exporting ESD. This may take a while..."
 Remove-Item "$mainOSDrive\tiny11\sources\install.wim" > $null 2>&1
 Write-Host "The tiny11 image is now completed. Proceeding with the making of the ISO..."
 Write-Host "Creating ISO image..."
-$ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$hostarchitecture\Oscdimg"
+$adkArch = switch ($hostArchitecture) { 'AMD64' { 'amd64' } 'ARM64' { 'arm64' } default { $hostArchitecture.ToLowerInvariant() } }
+$ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$adkArch\Oscdimg"
 $localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
 
 if ([System.IO.Directory]::Exists($ADKDepTools)) {

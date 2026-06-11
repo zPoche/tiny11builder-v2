@@ -51,6 +51,37 @@ if (-not $SCRATCH) {
 }
 
 #---------[ Functions ]---------#
+$Script:SpecialPackageEntries = @('OneDrive')
+
+function Get-AdkArchitecture {
+    param([string]$HostArchitecture)
+    switch ($HostArchitecture) {
+        'AMD64' { return 'amd64' }
+        'ARM64' { return 'arm64' }
+        default { return $HostArchitecture.ToLowerInvariant() }
+    }
+}
+
+function Assert-CommandExitCode {
+    param(
+        [string]$Label,
+        [int[]]$AllowedExitCodes = @(0)
+    )
+    if ($AllowedExitCodes -notcontains $LASTEXITCODE) {
+        throw "$Label failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Invoke-DismChecked {
+    param(
+        [string]$Label,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$DismArgs
+    )
+    & dism @DismArgs
+    Assert-CommandExitCode -Label $Label
+}
+
 function Set-RegistryValue {
     param (
         [string]$path,
@@ -58,23 +89,21 @@ function Set-RegistryValue {
         [string]$type,
         [string]$value
     )
-    try {
-        & 'reg' 'add' $path '/v' $name '/t' $type '/d' $value '/f' | Out-Null
-        Write-Output "Set registry value: $path\$name"
-    } catch {
-        Write-Output "Error setting registry value: $_"
-    }
+    & 'reg' 'add' $path '/v' $name '/t' $type '/d' $value '/f' | Out-Null
+    Assert-CommandExitCode -Label "reg add $path\$name"
+    Write-Output "Set registry value: $path\$name"
 }
 
 function Remove-RegistryValue {
     param (
         [string]$path
     )
-    try {
-        & 'reg' 'delete' $path '/f' | Out-Null
+    & 'reg' 'delete' $path '/f' | Out-Null
+    if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1) {
+        throw "reg delete $path failed with exit code $LASTEXITCODE"
+    }
+    if ($LASTEXITCODE -eq 0) {
         Write-Output "Removed registry value: $path"
-    } catch {
-        Write-Output "Error removing registry value: $_"
     }
 }
 
@@ -189,11 +218,38 @@ function Test-Prerequisites {
     Write-Output "Prerequisites OK."
 }
 
+function Test-ScratchDiskSpace {
+    param(
+        [string]$ScratchPath,
+        [uint64]$RequiredBytes = 20GB
+    )
+
+    $itemPath = $ScratchPath
+    if (-not (Test-Path $itemPath)) {
+        $itemPath = Split-Path $ScratchPath -Parent
+    }
+    if (-not (Test-Path $itemPath)) {
+        Write-Warning "Could not verify free disk space for $ScratchPath"
+        return
+    }
+
+    $driveName = (Get-Item $itemPath).PSDrive.Name
+    $freeBytes = (Get-PSDrive -Name $driveName).Free
+    $requiredGb = [math]::Round($RequiredBytes / 1GB)
+    $freeGb = [math]::Round($freeBytes / 1GB, 1)
+
+    Write-Output "Scratch disk ${driveName}: free space ${freeGb} GB (required: ${requiredGb} GB)"
+    if ($freeBytes -lt $RequiredBytes) {
+        throw "Insufficient free space on ${driveName}:. Need at least ${requiredGb} GB, but only ${freeGb} GB is available."
+    }
+}
+
 function Initialize-Oscdimg {
     param([string]$HostArchitecture)
 
     Write-Output "Checking for prerequisite oscdimg.exe..."
-    $ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$HostArchitecture\Oscdimg"
+    $adkArch = Get-AdkArchitecture -HostArchitecture $HostArchitecture
+    $ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$adkArch\Oscdimg"
     $localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
 
     if ([System.IO.Directory]::Exists($ADKDepTools)) {
@@ -309,11 +365,19 @@ if (! $myWindowsPrincipal.IsInRole($adminRole)) {
     exit
 }
 
+$autounattendDownloaded = $false
 if (-not (Test-Path -Path "$PSScriptRoot/autounattend.xml")) {
     Invoke-RestMethod "https://raw.githubusercontent.com/ntdevlabs/tiny11builder/refs/heads/main/autounattend.xml" -OutFile "$PSScriptRoot/autounattend.xml"
+    $autounattendDownloaded = $true
 }
 
 Start-Transcript -Path "$PSScriptRoot\tiny11_$(get-date -f yyyyMMdd_HHmms).log"
+
+trap {
+    Write-Error "Script failed: $($_.Exception.Message)"
+    Read-Host "Press Enter to exit"
+    exit 1
+}
 
 $Host.UI.RawUI.WindowTitle = "Tiny11 image creator"
 Clear-Host
@@ -321,6 +385,7 @@ Write-Output "Welcome to the tiny11 image creator! Release: 11-06-26"
 
 $hostArchitecture = $Env:PROCESSOR_ARCHITECTURE
 Test-Prerequisites
+Test-ScratchDiskSpace -ScratchPath $ScratchDisk
 $OSCDIMG = Initialize-Oscdimg -HostArchitecture $hostArchitecture
 
 New-Item -ItemType Directory -Force -Path "$ScratchDisk\tiny11\sources" | Out-Null
@@ -330,7 +395,7 @@ if ((Test-Path "$DriveLetter\sources\boot.wim") -eq $false -or (Test-Path "$Driv
     if ((Test-Path "$DriveLetter\sources\install.esd") -eq $true) {
         Write-Output "Found install.esd, converting to install.wim..."
         Get-WindowsImage -ImagePath $DriveLetter\sources\install.esd
-        $index = Read-Host "Please enter the image index"
+        $index = [int](Read-Host "Please enter the image index")
         Write-Output ' '
         Write-Output 'Converting install.esd to install.wim. This may take a while...'
         Export-WindowsImage -SourceImagePath $DriveLetter\sources\install.esd -SourceIndex $index -DestinationImagePath $ScratchDisk\tiny11\sources\install.wim -Compressiontype Maximum -CheckIntegrity
@@ -357,7 +422,7 @@ $index = $null
 $ImagesIndex = (Get-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\install.wim).ImageIndex
 while ($ImagesIndex -notcontains $index) {
     Get-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\install.wim
-    $index = Read-Host "Please enter the image index"
+    $index = [int](Read-Host "Please enter the image index")
 }
 Write-Output "Mounting Windows image. This may take a while."
 $wimFilePath = "$ScratchDisk\tiny11\sources\install.wim"
@@ -409,7 +474,7 @@ $packages = & 'dism' '/English' "/image:$($ScratchDisk)\scratchdir" '/Get-Provis
     }
 
 $packagePrefixes = Get-Content -Path "$PSScriptRoot\removePackage.txt" |
-    Where-Object { $_.Trim() -ne '' } |
+    Where-Object { $_.Trim() -ne '' -and -not $_.Trim().StartsWith('#') } |
     ForEach-Object { $_.Trim() }
 
 if ($Custom) {
@@ -430,10 +495,11 @@ if (-not $selectedPrefixes -or $selectedPrefixes.Count -eq 0) {
     Write-Output "Selected package prefixes to remove:"
     $selectedPrefixes | ForEach-Object { Write-Output " - $_" }
 
+    $appxPrefixes = $selectedPrefixes | Where-Object { $_ -notin $Script:SpecialPackageEntries }
     $packagesToRemove = $packages | Where-Object {
         $pkg = $_
         $match = $false
-        foreach ($pref in $selectedPrefixes) {
+        foreach ($pref in $appxPrefixes) {
             if ($pkg -like "*$pref*") { $match = $true; break }
         }
         $match
@@ -443,6 +509,9 @@ if (-not $selectedPrefixes -or $selectedPrefixes.Count -eq 0) {
 foreach ($package in $packagesToRemove) {
     Write-Output "Removing provisioned package: $package"
     & 'dism' '/English' "/image:$($ScratchDisk)\scratchdir" '/Remove-ProvisionedAppxPackage' "/PackageName:$package"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Failed to remove package $package (dism exit code $LASTEXITCODE)"
+    }
 }
 
 $removeEdge = (-not $Custom) -or (Test-PrefixSelected $selectedPrefixes 'Microsoft.MicrosoftEdge.Stable_8wekyb3d8bbwe!App')
@@ -456,10 +525,17 @@ if ($removeEdge) {
     Remove-Item -Path "$ScratchDisk\scratchdir\Windows\System32\Microsoft-Edge-Webview" -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
 }
 
-Write-Output "Removing OneDrive:"
-& 'takeown' '/f' "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe" | Out-Null
-& 'icacls' "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe" '/grant' "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
-Remove-Item -Path "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe" -Force -ErrorAction SilentlyContinue | Out-Null
+$removeOneDrive = (-not $Custom) -or (Test-PrefixSelected $selectedPrefixes 'OneDrive')
+if ($removeOneDrive) {
+    Write-Output "Removing OneDrive:"
+    if (Test-Path "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe") {
+        & 'takeown' '/f' "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe" | Out-Null
+        & 'icacls' "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe" '/grant' "$($adminGroup.Value):(F)" '/T' '/C' | Out-Null
+        Remove-Item -Path "$ScratchDisk\scratchdir\Windows\System32\OneDriveSetup.exe" -Force -ErrorAction SilentlyContinue | Out-Null
+    } else {
+        Write-Output "OneDriveSetup.exe not present, skipping."
+    }
+}
 Write-Output "Removal complete!"
 Start-Sleep -Seconds 2
 Clear-Host
@@ -522,8 +598,10 @@ if ($removeEdge) {
     Remove-RegistryValue "HKEY_LOCAL_MACHINE\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge Update"
 }
 
-Write-Output "Disabling OneDrive folder backup"
-Set-RegistryValue "HKLM\zSOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" "REG_DWORD" "1"
+if ($removeOneDrive) {
+    Write-Output "Disabling OneDrive folder backup"
+    Set-RegistryValue "HKLM\zSOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" "REG_DWORD" "1"
+}
 Write-Output "Disabling Search Highlights:"
 Set-RegistryValue 'HKLM\zSoftware\Microsoft\Windows\CurrentVersion\SearchSettings' 'IsDynamicSearchBoxEnabled' 'REG_DWORD' '0'
 Write-Output "Disabling Telemetry:"
@@ -551,16 +629,15 @@ $removeOutlook = (-not $Custom) -or (Test-PrefixSelected $selectedPrefixes 'Micr
 $removeCopilot = (-not $Custom) -or (Test-PrefixSelected $selectedPrefixes 'Microsoft.Windows.Copilot') -or (Test-PrefixSelected $selectedPrefixes 'Microsoft.Copilot')
 $removeTeams = (-not $Custom) -or (Test-PrefixSelected $selectedPrefixes 'Microsoft.Windows.Teams') -or (Test-PrefixSelected $selectedPrefixes 'MicrosoftTeams') -or (Test-PrefixSelected $selectedPrefixes 'MSTeams')
 
-if ($removeDevHome -or $removeOutlook) {
-    Write-Output "Prevents installation of DevHome and Outlook:"
-}
 if ($removeOutlook) {
+    Write-Output "Prevent installation of Outlook:"
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\OutlookUpdate' 'workCompleted' 'REG_DWORD' '1'
     Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate'
     Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Mail' 'PreventRun' 'REG_DWORD' '1'
 }
 if ($removeDevHome) {
+    Write-Output "Prevent installation of DevHome:"
     Set-RegistryValue 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\DevHomeUpdate' 'workCompleted' 'REG_DWORD' '1'
     Remove-RegistryValue 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\DevHomeUpdate'
 }
@@ -591,13 +668,13 @@ reg unload HKLM\zNTUSER | Out-Null
 reg unload HKLM\zSOFTWARE | Out-Null
 reg unload HKLM\zSYSTEM | Out-Null
 Write-Output "Cleaning up image..."
-dism.exe /Image:$ScratchDisk\scratchdir /Cleanup-Image /StartComponentCleanup /ResetBase
+Invoke-DismChecked -Label 'DISM cleanup' /Image:$ScratchDisk\scratchdir /Cleanup-Image /StartComponentCleanup /ResetBase
 Write-Output "Cleanup complete."
 Write-Output ' '
 Write-Output "Unmounting image..."
 Dismount-WindowsImage -Path $ScratchDisk\scratchdir -Save
 Write-Host "Exporting image..."
-Dism.exe /Export-Image /SourceImageFile:"$ScratchDisk\tiny11\sources\install.wim" /SourceIndex:$index /DestinationImageFile:"$ScratchDisk\tiny11\sources\install2.wim" /Compress:recovery
+Invoke-DismChecked -Label 'DISM export install.wim' /Export-Image /SourceImageFile:"$ScratchDisk\tiny11\sources\install.wim" /SourceIndex:$index /DestinationImageFile:"$ScratchDisk\tiny11\sources\install2.wim" /Compress:recovery
 Remove-Item -Path "$ScratchDisk\tiny11\sources\install.wim" -Force | Out-Null
 Rename-Item -Path "$ScratchDisk\tiny11\sources\install2.wim" -NewName "install.wim" | Out-Null
 Write-Output "Windows image completed. Continuing with boot.wim."
@@ -645,6 +722,7 @@ Copy-Item -Path "$PSScriptRoot\autounattend.xml" -Destination "$ScratchDisk\tiny
 Write-Output "Creating ISO image..."
 
 & "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$ScratchDisk\tiny11\boot\etfsboot.com#pEF,e,b$ScratchDisk\tiny11\efi\microsoft\boot\efisys.bin" "$ScratchDisk\tiny11" "$PSScriptRoot\tiny11.iso"
+Assert-CommandExitCode -Label 'oscdimg ISO creation'
 
 Write-Output "Creation completed! Press any key to exit the script..."
 Read-Host "Press Enter to continue"
@@ -662,8 +740,10 @@ if (-not $MountedByScript) {
     }
 }
 
-Write-Output "Removing autounattend.xml..."
-Remove-Item -Path "$PSScriptRoot\autounattend.xml" -Force -ErrorAction SilentlyContinue
+if ($autounattendDownloaded) {
+    Write-Output "Removing downloaded autounattend.xml..."
+    Remove-Item -Path "$PSScriptRoot\autounattend.xml" -Force -ErrorAction SilentlyContinue
+}
 
 Write-Output "Cleanup check :"
 if (Test-Path -Path "$ScratchDisk\tiny11") {
@@ -688,16 +768,9 @@ if (Test-Path -Path "$ScratchDisk\scratchdir") {
 } else {
     Write-Output "scratchdir folder does not exist. No action needed."
 }
-if (Test-Path -Path "$PSScriptRoot\autounattend.xml") {
+if ($autounattendDownloaded -and (Test-Path -Path "$PSScriptRoot\autounattend.xml")) {
     Write-Output "autounattend.xml still exists. Attempting to remove it again..."
     Remove-Item -Path "$PSScriptRoot\autounattend.xml" -Force -ErrorAction SilentlyContinue
-    if (Test-Path -Path "$PSScriptRoot\autounattend.xml") {
-        Write-Output "Failed to remove autounattend.xml."
-    } else {
-        Write-Output "autounattend.xml removed successfully."
-    }
-} else {
-    Write-Output "autounattend.xml does not exist. No action needed."
 }
 
 Stop-Transcript

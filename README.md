@@ -46,7 +46,8 @@ C:/path/to/your/tiny11/script.ps1 -ISO <inputletter> -SCRATCH <outputletter>
 ```powershell
 C:/path/to/your/tiny11/script.ps1 -ISO E -SCRATCH D -Custom
 ```
-Without `-Custom`, all packages listed in `removePackage.txt` are removed (default).
+Without `-Custom`, all packages listed in `removePackage.txt` are removed (default).  
+`OneDrive` is listed separately and can also be kept via `-Custom`.
 
 6. Select the SKU that you want the image to be based.
 7. Sit back and relax :)
