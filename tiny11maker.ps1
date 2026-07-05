@@ -1023,6 +1023,7 @@ $wimFilePath = "$ScratchDisk\tiny11\sources\boot.wim"
 Clear-FileReadOnly -FilePath $wimFilePath
 $bootWimIndex = Get-BootWimIndex -BootWimPath "$ScratchDisk\tiny11\sources\boot.wim"
 Write-Output "Using boot.wim index $bootWimIndex"
+New-Item -ItemType Directory -Force -Path "$ScratchDisk\scratchdir" | Out-Null
 Mount-WindowsImage -ImagePath $ScratchDisk\tiny11\sources\boot.wim -Index $bootWimIndex -Path $ScratchDisk\scratchdir
 Write-Output "Loading registry..."
 Invoke-RegLoad -HiveName 'zCOMPONENTS' -FilePath "$ScratchDisk\scratchdir\Windows\System32\config\COMPONENTS"
