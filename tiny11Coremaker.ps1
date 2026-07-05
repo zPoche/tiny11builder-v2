@@ -869,6 +869,7 @@ $wimFilePath = "$($env:SystemDrive)\tiny11\sources\boot.wim"
 Clear-FileReadOnly -FilePath $wimFilePath
 $bootWimIndex = Get-BootWimIndex -BootWimPath "$mainOSDrive\tiny11\sources\boot.wim"
 Write-Host "Using boot.wim index $bootWimIndex"
+New-Item -ItemType Directory -Force -Path "$mainOSDrive\scratchdir" | Out-Null
 Mount-WindowsImage -ImagePath "$mainOSDrive\tiny11\sources\boot.wim" -Index $bootWimIndex -Path "$mainOSDrive\scratchdir"
 Write-Host "Loading registry..."
 Invoke-RegLoad -HiveName 'zCOMPONENTS' -FilePath "$mainOSDrive\scratchdir\Windows\System32\config\COMPONENTS"
